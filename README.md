@@ -61,23 +61,6 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
-
-### Automatic upload of generated files (`sweep`, v1.3.0+)
-
-Pushing this repo to git only *shares the code*. Files reach S3 only when something runs it.
-`sweep` is the no-edit option: it uploads every **new or changed** file in a folder and remembers
-what it has uploaded (`.fathom_recovery_state.json`, path -> sha256), so reruns skip unchanged files.
-A file is recorded only after its upload verified OK; failures are retried on the next sweep.
-
-```
-python3 scripts/fathom_recovery.py sweep --panel-name "<Panel>" --dir . --pattern "*.csv"          # dry run
-python3 scripts/fathom_recovery.py sweep --panel-name "<Panel>" --dir . --pattern "*.csv" --apply  # upload
-```
-Or from code, once at the end of the panel's generation step: `panel_snippet.sweep_now()`.
-Defaults: csv, xlsx, xls, json, parquet, txt; skips `.git`, `.fathom_runtime`, `knowledge`, `tests`, `__pycache__`.
-It is **not** instant: it only runs when called or scheduled, so files are backed up at the next sweep.
-A deleted-then-recreated identical file is not re-uploaded (same hash).
-
 ## Finding and restoring
 
 ```
