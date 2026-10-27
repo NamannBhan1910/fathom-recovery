@@ -61,7 +61,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 DESTINATION_BUCKET = os.environ.get("RECOVERY_DESTINATION_BUCKET", "mosaic-derivatives-margining")
 DESTINATION_PREFIX = os.environ.get("RECOVERY_DESTINATION_PREFIX", "6_Recovery/")

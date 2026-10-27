@@ -398,6 +398,44 @@ class PlaceholderGuard(unittest.TestCase):
     def test_user_with_angle_brackets_is_not_blocked(self):
         self.assertEqual(fr.resolve_user("a<b"), "a<b")
 
+class PanelSnippet(unittest.TestCase):
+    """panel_snippet.py must import fathom_recovery from its own folder OR from ./scripts."""
+
+    def _run(self, layout):
+        import pathlib
+        import shutil
+        import subprocess
+        import tempfile
+        root = pathlib.Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            shutil.copy(root / "panel_snippet.py", d)
+            dest = d / "scripts" if layout == "scripts" else d
+            dest.mkdir(exist_ok=True)
+            shutil.copy(root / "fathom_recovery.py", dest)
+            code = ("import panel_snippet as p, fathom_recovery as f\n"
+                    "assert p.sweep_now and p.push\n"
+                    "print('OK', f.__version__)\n")
+            return subprocess.run([sys.executable, "-c", code], cwd=d, capture_output=True, text=True)
+
+    def test_import_from_scripts_folder(self):
+        r = self._run("scripts")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_import_from_same_folder(self):
+        r = self._run("same")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_sweep_now_uses_same_default_patterns_as_sweep(self):
+        import inspect
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parent.parent / "panel_snippet.py").read_text()
+        self.assertIn("SWEEP_DEFAULT_PATTERNS", src)
+        self.assertIn("patterns=None", src)
+        self.assertIn(".txt", ",".join(fr.SWEEP_DEFAULT_PATTERNS))
+
+
+
 
 
 

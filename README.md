@@ -27,16 +27,17 @@ Bucket/prefix defaults can be overridden with `RECOVERY_DESTINATION_BUCKET` / `R
 ```
 fathom-recovery/
   fathom_recovery.py        # the whole library + CLI (single file, needs only boto3)
-  panel_snippet.py          # paste-in block for a panel's generation code
+  panel_snippet.py          # paste-in block for a panel's generation code (push, sweep_now)
+  sync_recovery.py          # installs fathom_recovery.py into a panel from this repo at a tag
   tests/test_fathom_recovery.py   # offline tests, fake S3, no network
   README.md
 ```
 
 ## Using it in a panel (rollout)
 
-1. **Get the file into the panel workspace.** Copy `fathom_recovery.py` into the panel's
-   `scripts/` folder (or push this folder to your git remote and pull it in each panel's
-   workspace; that is the way to keep one version across projects).
+1. **Get the file into the panel workspace.** Install it with `sync_recovery.py` (see "Sharing
+   across panels" below), which keeps one tagged version across projects, or copy
+   `fathom_recovery.py` into the panel's `scripts/` folder by hand.
 2. **Push the panel's output** (see `panel_snippet.py`). Simplest path, `upload_to_recovery`
    (v1.2.0+), takes bytes, text, or a `pathlib.Path` to a local file:
 
@@ -62,21 +63,34 @@ python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --so
 ```
 
 
-### Automatic upload of generated files (`sweep`, v1.3.0+)
+### Uploading generated files in bulk (`sweep`, v1.3.0+)
 
-Pushing this repo to git only *shares the code*. Files reach S3 only when something runs it.
-`sweep` is the no-edit option: it uploads every **new or changed** file in a folder and remembers
-what it has uploaded (`.fathom_recovery_state.json`, path -> sha256), so reruns skip unchanged files.
-A file is recorded only after its upload verified OK; failures are retried on the next sweep.
+**Nothing in this repo runs by itself.** Cloning or installing it uploads nothing. Files reach S3
+only when something calls `push`, `sweep_now` or the `sweep` command.
+
+`sweep` saves you from calling `push` once per file: it uploads every **new or changed** file in a
+folder and remembers what it has uploaded (`.fathom_recovery_state.json`, path -> sha256), so
+reruns skip unchanged files. A file is recorded only after its upload verified OK; failures are
+retried on the next sweep. Something still has to trigger it:
+
+| Trigger | When files reach S3 | What the panel needs |
+|---|---|---|
+| `push(data, filename)` after each file is written | Immediately | One line per file |
+| `sweep_now("outputs")` at the end of the generation step | At the end of each run | One line per run |
+| `sweep` command on a schedule | At the next scheduled run | A schedule (none is created by this repo) |
 
 ```
 python3 scripts/fathom_recovery.py sweep --panel-name "<Panel>" --dir . --pattern "*.csv"          # dry run
 python3 scripts/fathom_recovery.py sweep --panel-name "<Panel>" --dir . --pattern "*.csv" --apply  # upload
 ```
-Or from code, once at the end of the panel's generation step: `panel_snippet.sweep_now()`.
-Defaults: csv, xlsx, xls, json, parquet, txt; skips `.git`, `.fathom_runtime`, `knowledge`, `tests`, `__pycache__`.
-It is **not** instant: it only runs when called or scheduled, so files are backed up at the next sweep.
-A deleted-then-recreated identical file is not re-uploaded (same hash).
+- Defaults (command and `sweep_now`): csv, xlsx, xls, json, parquet, txt. It skips `.git`,
+  `.fathom_runtime`, `knowledge`, `tests`, `__pycache__`, `node_modules` and `.venv`.
+- Call it after the files are fully written, so a half-written file is not uploaded.
+- Files are uploaded by bare name, so same-named files in different subfolders are stored separately.
+- Each file is read into memory whole, and the state file is saved once at the end of a sweep. If a
+  sweep is interrupted, that run's files upload again next time (extra copies, no data loss).
+- A deleted-then-recreated identical file is not re-uploaded (same hash).
+- If a panel's workspace is reset, the state file is lost and the next sweep uploads everything once.
 
 ## Finding and restoring
 
@@ -122,18 +136,21 @@ Exact spelling matters. Add a row before a panel starts uploading.
 
 ## Sharing across panels (git)
 
-**Publish (owner, once per release):** commit, tag (`git tag -a v1.2.0 -m v1.2.0`), and
-`git push origin main v1.2.0` to the shared private repo. Give panel owners read access
-(or a read-only deploy token).
+**Publish (owner, once per release):** commit, tag (`git tag -a v1.3.1 -m v1.3.1`), and
+`git push origin main v1.3.1`. The repo is currently public and contains no credentials. If it is
+made private, give panel owners read access or a read-only token.
 
-**Install in a panel:**
+**Install in a panel** (a fresh panel needs `sync_recovery.py` first; fetch it from the repo):
 
 ```
-export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.2.0 --dest scripts --run-tests
+git clone --depth 1 --branch v1.3.1 https://github.com/NamannBhan1910/fathom-recovery.git
+python3 fathom-recovery/sync_recovery.py --repo https://github.com/NamannBhan1910/fathom-recovery.git \
+    --ref v1.3.1 --dest scripts --run-tests
 ```
-Prints the installed version, commit and sha256. Pin a tag, not `main`.
-To upgrade a panel, rerun with the new tag.
+For a private repo, `export FATHOM_RECOVERY_GIT_TOKEN=...` first (never put it in the URL).
+`sync_recovery.py` prints the installed version, commit and sha256, and replaces any existing
+`scripts/fathom_recovery.py`. Pin a tag, not `main`. To upgrade a panel, rerun with the new tag.
+It installs only `fathom_recovery.py`; copy `panel_snippet.py` into the panel yourself and set `PANEL_NAME`.
 
 **Verify in the panel:**
 
