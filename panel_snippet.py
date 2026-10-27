@@ -3,14 +3,22 @@
 Set PANEL_NAME to the exact name the user gave (case and spaces matter).
 Files land in:  6_Recovery/<PANEL_NAME>/<user>/<timestamp>-<8 hex>/<filename>
 
-`upload_to_recovery` is the simplest way to push a panel's output: bytes, text or a local
-file go straight to the panel's recovery folder and are verified (size + sha256).
+Two ways to use it (neither runs by itself; the panel's code must call one):
+  push(data, filename)  - upload ONE file right when it is created
+  sweep_now(folder)     - upload every NEW or CHANGED file in a folder; call it once at the
+                          end of the generation step, after the files are fully written
+
+`fathom_recovery.py` is looked up next to this file first, then in a `scripts/` folder next to
+it (where sync_recovery.py installs it by default).
 """
 import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))  # where fathom_recovery.py lives
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (_HERE, os.path.join(_HERE, "scripts")):
+    if os.path.isfile(os.path.join(_p, "fathom_recovery.py")) and _p not in sys.path:
+        sys.path.insert(0, _p)
 from fathom_recovery import copy_created_object_to_recovery, upload_to_recovery
 
 PANEL_NAME = "<Panel Name given by the user>"
@@ -30,15 +38,16 @@ def push(data, filename=None, content_type=None) -> dict:
     return res
 
 
-def sweep_now(directory: str = ".", patterns=("*.csv", "*.xlsx", "*.json", "*.parquet")) -> dict:
+def sweep_now(directory: str = ".", patterns=None) -> dict:
     """Upload every NEW or CHANGED file under `directory` (no per-file calls needed).
 
     Call this once at the end of the panel's generation code. Files already uploaded and
     unchanged are skipped, so it is safe to call after every run.
+    `patterns` defaults to the same list as the `sweep` command (csv, xlsx, xls, json, parquet, txt).
     """
-    from fathom_recovery import sweep
+    from fathom_recovery import SWEEP_DEFAULT_PATTERNS, sweep
 
-    res = sweep(directory, PANEL_NAME, patterns=patterns, apply=True)
+    res = sweep(directory, PANEL_NAME, patterns=patterns or SWEEP_DEFAULT_PATTERNS, apply=True)
     print(f"Recovery sweep: uploaded={res['uploaded']} unchanged={res['unchanged']} failed={res['failed']}")
     for f in res["files"]:
         if f["action"] == "failed":
@@ -54,3 +63,4 @@ def backup_existing(bucket: str, key: str) -> dict:
 # Examples:
 #   push(csv_bytes, "report.csv")
 #   push(Path("report.csv"))
+#   sweep_now("outputs")
