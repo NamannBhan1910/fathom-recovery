@@ -45,7 +45,7 @@ def git(*args: str, token: str | None = None) -> str:
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
         env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {basic}"
-    result = subprocess.run([find_git(), *args], cwd=REPO_DIR, env=env,
+    result = subprocess.run([find_git(), "-c", f"safe.directory={REPO_DIR}", *args], cwd=REPO_DIR, env=env,
                             capture_output=True, text=True, check=False)
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
