@@ -86,8 +86,8 @@ Offline only; nothing touches S3.
 
 ## Sharing across panels (git)
 
-**First publication (personal GitHub account):** From this repo in your VS Code terminal,
-run `python publish_personal_repo.py`. Enter a GitHub token at the masked prompt.
+**First publication (personal GitHub account):** In your VS Code terminal,
+run `python <path-to-this-repo>/publish_personal_repo.py`. Enter a GitHub token at the masked prompt.
 The script verifies the account is `NamannBhan1910`, creates a **private** repository
 if needed, then pushes `main` and `v1.2.0`. The token is not saved. It needs permission
 to create a private repository and push code. When ready for company ownership, transfer

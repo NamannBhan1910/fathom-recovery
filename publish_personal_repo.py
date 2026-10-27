@@ -13,12 +13,14 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 OWNER = "NamannBhan1910"
 NAME = "fathom-recovery"
 TAG = "v1.2.0"
 API = "https://api.github.com"
+REPO_DIR = Path(__file__).resolve().parent
 
 
 def git(*args: str, token: str | None = None) -> str:
@@ -30,7 +32,8 @@ def git(*args: str, token: str | None = None) -> str:
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
         env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {basic}"
-    result = subprocess.run(["git", *args], env=env, capture_output=True, text=True, check=False)
+    result = subprocess.run(["git", *args], cwd=REPO_DIR, env=env,
+                            capture_output=True, text=True, check=False)
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
         if token:
