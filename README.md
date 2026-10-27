@@ -28,6 +28,8 @@ Set `RECOVERY_DESTINATION_BUCKET` in each panel (for the current project, `mosai
 fathom-recovery/
   fathom_recovery.py        # the whole library + CLI (single file, needs only boto3)
   panel_snippet.py          # paste-in block for a panel's generation code
+  sync_recovery.py          # install a pinned release into another panel
+  publish_personal_repo.py  # create/push the initial private personal GitHub repo
   tests/test_fathom_recovery.py   # offline tests, fake S3, no network
   README.md
 ```
@@ -83,6 +85,13 @@ Offline only; nothing touches S3.
 - Needs AWS credentials with `s3:GetObject` and `s3:PutObject` on the source and recovery locations, and `s3:ListBucket` for `list`.
 
 ## Sharing across panels (git)
+
+**First publication (personal GitHub account):** From this repo in your VS Code terminal,
+run `python publish_personal_repo.py`. Enter a GitHub token at the masked prompt.
+The script verifies the account is `NamannBhan1910`, creates a **private** repository
+if needed, then pushes `main` and `v1.2.0`. The token is not saved. It needs permission
+to create a private repository and push code. When ready for company ownership, transfer
+the repository in GitHub and update each panel's `--repo` URL.
 
 **Publish (owner, once per release):** commit, tag (`git tag -a v1.2.0 -m v1.2.0`), and
 `git push origin main v1.2.0` to the shared private repo. Give panel owners read access
