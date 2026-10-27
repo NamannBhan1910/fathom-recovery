@@ -10,6 +10,7 @@ import base64
 import getpass
 import json
 import os
+import shutil
 import subprocess
 import urllib.error
 import urllib.request
@@ -23,6 +24,18 @@ API = "https://api.github.com"
 REPO_DIR = Path(__file__).resolve().parent
 
 
+def find_git() -> str:
+    candidates = [
+        shutil.which("git"),
+        Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/native/git/cmd/git.exe",
+        Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/cmd/git.exe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    raise RuntimeError("Git was not found. Install Git for Windows or set Git on PATH, then retry.")
+
+
 def git(*args: str, token: str | None = None) -> str:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -32,7 +45,7 @@ def git(*args: str, token: str | None = None) -> str:
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
         env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {basic}"
-    result = subprocess.run(["git", *args], cwd=REPO_DIR, env=env,
+    result = subprocess.run([find_git(), *args], cwd=REPO_DIR, env=env,
                             capture_output=True, text=True, check=False)
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
