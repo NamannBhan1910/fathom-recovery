@@ -61,6 +61,23 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
+### Fastest setup for a new panel (v1.5.1+)
+
+Run these in the panel's workspace root (in Fathom, ask the panel's agent to run them). The clone goes
+into a folder named after the version, so running the lines again never fails with "already exists":
+
+```
+[ -d fathom-recovery-v1.5.1 ] || git clone --depth 1 --branch v1.5.1 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.5.1
+python3 fathom-recovery-v1.5.1/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+```
+
+`setup_panel.py` installs `scripts/fathom_recovery.py` from that clone, writes `recovery_config.json` and
+`RECOVERY_INSTRUCTIONS.md` (an existing config is kept), runs `selfcheck`, and does a first `sweep`. Every
+step prints PASS / FAIL. Without `--apply` it is a dry run and writes nothing to S3. `--with-snippet`
+also copies `panel_snippet.py`. A FAIL mentioning AccessDenied or NoCredentialsError means that panel's
+runtime has no S3 permission on `6_Recovery/`. `RECOVERY_INSTRUCTIONS.md` now includes these setup lines, so
+the panel's agent can do the setup itself.
+
 ### Making a panel upload new files (v1.5.0+)
 
 Nothing in this repo watches for files or runs by itself. What it does give you is a standing
@@ -140,8 +157,10 @@ Spelling matters except for case and extra spaces. Add a row before a panel star
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.5.0 --dest scripts --run-tests --panel-name "<Panel>"
+python3 sync_recovery.py --repo <git url> --ref v1.5.1 --dest scripts --run-tests --panel-name "<Panel>"
 ```
+(`sync_recovery.py` itself can be run again and again; only a plain `git clone` into an existing folder
+fails, so clone into a new or versioned folder name.)
 Prints the installed version, commit and sha256. Pin a tag, not `main`.
 To upgrade a panel, rerun with the new tag.
 

@@ -692,6 +692,83 @@ class PanelConfigAndInstructions(unittest.TestCase):
 
 
 
+class SetupPanel(unittest.TestCase):
+    """setup_panel.py: one-command install/config/check. No S3 is touched (dry run + --skip-selfcheck)."""
+
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.d = __import__("pathlib").Path(self._td.name)
+        self.root = __import__("pathlib").Path(__file__).resolve().parent.parent
+
+    def _run(self, *args):
+        import subprocess
+        return subprocess.run([sys.executable, str(self.root / "setup_panel.py"), *args], cwd=self.d,
+                              capture_output=True, text=True)
+
+    def test_setup_installs_writes_config_and_is_rerunnable(self):
+        r = self._run("--panel-name", "  my   panel ", "--skip-selfcheck")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.d / "scripts" / "fathom_recovery.py").is_file())
+        cfg = __import__("json").loads((self.d / "recovery_config.json").read_text())
+        self.assertEqual(cfg["panel_name"], "my panel")
+        self.assertTrue((self.d / "outputs").is_dir())
+        self.assertIn("ALL STEPS PASSED", r.stdout)
+        r2 = self._run("--panel-name", "my panel", "--skip-selfcheck")  # second run must also succeed
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+        self.assertIn("already up to date", r2.stdout)
+        self.assertIn("kept as is", r2.stdout)
+
+    def test_existing_config_is_not_overwritten(self):
+        (self.d / "recovery_config.json").write_text('{"panel_name": "Edited", "output_dir": "data"}')
+        r = self._run("--panel-name", "Other Name", "--skip-selfcheck")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Edited", (self.d / "recovery_config.json").read_text())
+        self.assertTrue((self.d / "data").is_dir())  # folder from the config in effect, not --output-dir
+        self.assertTrue((self.d / "RECOVERY_INSTRUCTIONS.md").is_file())
+
+    def test_bad_names_fail_clearly_and_write_nothing(self):
+        for bad in ("..", "<Panel Name>", "   "):
+            r = self._run("--panel-name", bad)
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("FAIL", r.stdout)
+            self.assertNotIn("Traceback", r.stdout + r.stderr)
+        self.assertEqual(list(self.d.iterdir()), [])
+
+    def test_dry_run_sweep_reports_without_uploading(self):
+        (self.d / "outputs").mkdir()
+        (self.d / "outputs" / "a.csv").write_text("x\n1\n")
+        r = self._run("--panel-name", "P", "--skip-selfcheck")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("would_upload=1", r.stdout)
+        self.assertIn("uploaded=0", r.stdout)
+        self.assertFalse((self.d / "outputs" / ".fathom_recovery_state.json").exists())
+
+    def test_with_snippet_copies_it(self):
+        r = self._run("--panel-name", "P", "--skip-selfcheck", "--with-snippet")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.d / "panel_snippet.py").is_file())
+
+
+class InstructionsText(unittest.TestCase):
+    def test_instructions_include_setup_and_versioned_clone(self):
+        ins = fr.render_instructions("My Panel", "outputs")
+        self.assertIn("Setup (once per panel", ins)
+        self.assertIn(f"fathom-recovery-v{fr.__version__}", ins)
+        self.assertIn("setup_panel.py", ins)
+        self.assertIn(fr.REPO_URL, ins)
+        self.assertIn("AccessDenied", ins)
+        self.assertIn("sweep --config recovery_config.json --apply", ins)
+        self.assertIn("Nothing uploads by itself", ins)
+
+    def test_setup_clone_line_is_idempotent_shell(self):
+        ins = fr.render_instructions("P")
+        line = [l for l in ins.splitlines() if "git clone" in l][0]
+        self.assertTrue(line.strip().startswith("[ -d "))  # skipped when the folder already exists
+
+
+
 class Defaults(unittest.TestCase):
     def test_target_defaults(self):
         self.assertEqual(fr.DESTINATION_BUCKET, "mosaic-derivatives-margining")

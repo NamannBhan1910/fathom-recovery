@@ -63,7 +63,8 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
+REPO_URL = "https://github.com/NamannBhan1910/fathom-recovery.git"
 
 DESTINATION_BUCKET = os.environ.get("RECOVERY_DESTINATION_BUCKET", "mosaic-derivatives-margining")
 DESTINATION_PREFIX = os.environ.get("RECOVERY_DESTINATION_PREFIX", "6_Recovery/")
@@ -744,6 +745,14 @@ def render_instructions(panel_name: str, output_dir: str = "outputs", config_pat
 Panel name: "{panel}"   (set in {config_path}; case and extra spaces do not matter)
 Data folder: {output_dir}
 
+Setup (once per panel; skip it if scripts/fathom_recovery.py already exists):
+
+       [ -d fathom-recovery-v{__version__} ] || git clone --depth 1 --branch v{__version__} {REPO_URL} fathom-recovery-v{__version__}
+       python3 fathom-recovery-v{__version__}/setup_panel.py --panel-name "{panel}" --output-dir {output_dir} --apply
+
+   Show me every PASS/FAIL line. A FAIL that mentions AccessDenied or NoCredentialsError means this
+   panel has no S3 permission on 6_Recovery/: tell me and stop, nothing else will work until it is fixed.
+
 Rule (follow it every time, without being asked):
 
 1. Whenever you create or change a data file in this panel (csv, xlsx, xls, json, parquet, txt),
@@ -753,7 +762,8 @@ Rule (follow it every time, without being asked):
 
    then tell me how many files were uploaded, unchanged, or failed.
 2. At the start of every session, run the same command once. It uploads anything a previous
-   run missed and skips files that are already uploaded.
+   run missed and skips files that are already uploaded. If scripts/fathom_recovery.py is missing,
+   do the Setup first.
 3. If it reports a failure or AccessDenied, tell me. Do not retry silently or skip it.
 4. Never delete anything in S3 and never edit {config_path} yourself unless I ask.
 
