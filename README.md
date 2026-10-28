@@ -22,13 +22,14 @@ create extra folders; blank, `.` and `..` are rejected) **before** any write.
 
 Bucket/prefix defaults can be overridden with `RECOVERY_DESTINATION_BUCKET` / `RECOVERY_DESTINATION_PREFIX`.
 
-## Layout change in v1.6.0: user first, then panel
+## Layout change in v1.6.0: user first, then panel (v1.6.1: user folder matched ignoring case, LAYOUT marker)
 
 Before v1.6.0 files went to `6_Recovery/<Panel>/<user>/...`. From v1.6.0 they go to
 `6_Recovery/<user>/<Panel>/...`, so each user has one folder holding all of their panels.
 
-- Panel names are matched (case and extra spaces ignored) only inside the current user's folder, so two
-  users can have panels with the same name without sharing a folder.
+- The user folder is matched ignoring case (`nbhan` -> existing `NBHAN`), then panel names are matched (case
+  and extra spaces ignored) only inside that user's folder, so two users can have panels with the same name
+  without sharing a folder.
 - `list` shows the current user's panel by default; `--user <name>` looks at another user's.
 - Nothing already in S3 was moved or renamed. Objects written before v1.6.0 stay under the old path and
   can be found with `list --legacy` and restored with their `recovery_path` as before.
@@ -72,14 +73,14 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
-### Fastest setup for a new panel (v1.6.0+)
+### Fastest setup for a new panel (v1.6.1+)
 
 Run these in the panel's workspace root (in Fathom, ask the panel's agent to run them). The clone goes
 into a folder named after the version, so running the lines again never fails with "already exists":
 
 ```
-[ -d fathom-recovery-v1.6.0 ] || git clone --depth 1 --branch v1.6.0 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.6.0
-python3 fathom-recovery-v1.6.0/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.6.1 ] || git clone --depth 1 --branch v1.6.1 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.6.1
+python3 fathom-recovery-v1.6.1/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone, writes `recovery_config.json` and
@@ -142,8 +143,12 @@ Offline only; nothing touches S3.
 - Needs AWS credentials with `s3:GetObject` and `s3:PutObject` on the source and recovery locations, and `s3:ListBucket` for `list`.
   For `upload` only the recovery prefix is needed: `s3:PutObject`, `s3:GetObject` (read-back check) and `s3:ListBucket`
   on `6_Recovery/*`. Run `selfcheck --apply` in each panel to confirm; AccessDenied means that panel has no access yet.
-- The `<user>` folder is case-sensitive (`NBHAN` and `nbhan` are different folders). Let `resolve_user()` pick it
-  (or set `RECOVERY_USER`) instead of hardcoding one.
+- The `<user>` folder is matched ignoring case (`resolve_user_folder()`): `nbhan` uses an existing `NBHAN`.
+  An exact spelling always wins; if only different-case folders exist and there are several (`NBHAN` and `NbHan`),
+  the call fails and the exact spelling must be used. If the listing is not permitted, the name is used as given
+  with a warning. Let `resolve_user()` pick the user (or set `RECOVERY_USER`) instead of hardcoding one.
+- `fathom_recovery.py` contains the line `LAYOUT = "user/panel"`. A panel can check which layout its copy
+  writes with `grep -c 'LAYOUT = "user/panel"' scripts/fathom_recovery.py` (1 = current, 0 = older panel-first).
 
 ## Registered panel names
 
@@ -168,7 +173,7 @@ Spelling matters except for case and extra spaces. Add a row before a panel star
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.6.0 --dest scripts --run-tests --panel-name "<Panel>"
+python3 sync_recovery.py --repo <git url> --ref v1.6.1 --dest scripts --run-tests --panel-name "<Panel>"
 ```
 (`sync_recovery.py` itself can be run again and again; only a plain `git clone` into an existing folder
 fails, so clone into a new or versioned folder name.)

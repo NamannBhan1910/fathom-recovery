@@ -7,7 +7,8 @@ that panel's generation code. Every panel writes to its own folder:
     s3://<bucket>/6_Recovery/<user>/<Panel Name>/<YYYYMMDDTHHMMSSZ>-<8 hex>/<filename>
 
 * <user>        explicit arg > RECOVERY_USER env > bridge.whoami() > "unknown-user".
-                Files are segregated per user first, then per panel.
+                Files are segregated per user first, then per panel. Matched to an existing
+                user folder ignoring case ('nbhan' uses 'NBHAN'); exact spelling wins.
 * <Panel Name>  REQUIRED. Supplied by the user / caller at execution time.
                 Matched to an existing folder of THAT user ignoring case and extra spaces.
 * timestamp-id  UTC time of the copy + random 8 hex. Unique per copy: nothing is
@@ -64,7 +65,8 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
+LAYOUT = "user/panel"  # marker: <prefix>/<user>/<panel>/<run>/<file>. Panels grep for this line.
 REPO_URL = "https://github.com/NamannBhan1910/fathom-recovery.git"
 
 DESTINATION_BUCKET = os.environ.get("RECOVERY_DESTINATION_BUCKET", "mosaic-derivatives-margining")
@@ -180,6 +182,51 @@ def _require_panel(panel_name: Any) -> str:
     return _safe_segment(panel_name, "panel_name")
 
 
+def _list_folders(client: Any, bucket: str, root: str) -> list[str]:
+    """Names of the immediate sub-folders under `root` (read-only delimiter listing)."""
+    names: list[str] = []
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=root, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            names.append(cp["Prefix"][len(root):].rstrip("/"))
+    return names
+
+
+def _match_folder(wanted: str, names: list[str], what: str) -> str:
+    """exact spelling > the single case/extra-space-insensitive match > the name as given.
+
+    Several case-insensitive matches (and no exact one) raise ValueError: the exact spelling is needed.
+    """
+    if wanted in names:
+        return wanted
+    want = " ".join(wanted.split()).casefold()
+    matches = sorted({n for n in names if " ".join(n.split()).casefold() == want})
+    if len(matches) > 1:
+        raise ValueError(f"{what} {wanted!r} matches several existing folders {matches}; use the exact spelling")
+    return matches[0] if matches else wanted
+
+
+def resolve_user_folder(
+    user: str | None = None,
+    *,
+    destination_bucket: str = DESTINATION_BUCKET,
+    destination_prefix: str = DESTINATION_PREFIX,
+    s3: Any | None = None,
+) -> str:
+    """Return the user folder to use under the prefix, ignoring case ('nbhan' -> existing 'NBHAN').
+
+    The user comes from resolve_user() (arg > RECOVERY_USER > bridge.whoami() > unknown-user), then is
+    matched against the existing top-level folders (read-only listing):
+      * exact spelling exists            -> use it (so an exact name always wins, even if 'nbhan' also exists)
+      * exactly one case-insensitive hit -> use that folder's spelling
+      * several case-insensitive hits    -> ValueError (ambiguous; pass the exact spelling)
+      * no hit                           -> the name as given (the folder is created on first upload)
+    """
+    who = resolve_user(user)
+    client = s3 or boto3.client("s3")
+    root = _clean_prefix(destination_prefix)
+    return _match_folder(who, _list_folders(client, destination_bucket, root), "user")
+
+
 def resolve_panel_folder(
     panel_name: str,
     *,
@@ -191,7 +238,8 @@ def resolve_panel_folder(
     """Return the panel folder name to use inside THIS USER's folder, ignoring case and extra spaces.
 
     S3 keys are case-sensitive, so 'daily checklist equities' would otherwise create a second
-    folder. This lists the panel folders under <prefix><user>/ (read-only):
+    folder. The user folder is matched case-insensitively first (resolve_user_folder), then this
+    lists the panel folders under <prefix><user>/ (read-only):
       * exact spelling exists            -> use it
       * exactly one case-insensitive hit -> use that folder's spelling
       * several case-insensitive hits    -> ValueError (ambiguous; use the exact spelling)
@@ -199,40 +247,32 @@ def resolve_panel_folder(
     """
     panel = _require_panel(panel_name)
     client = s3 or boto3.client("s3")
-    root = f"{_clean_prefix(destination_prefix)}{resolve_user(user)}/"
-    names: list[str] = []
-    for page in client.get_paginator("list_objects_v2").paginate(
-        Bucket=destination_bucket, Prefix=root, Delimiter="/"
-    ):
-        for cp in page.get("CommonPrefixes", []):
-            names.append(cp["Prefix"][len(root):].rstrip("/"))
-    if panel in names:
-        return panel
-    want = panel.casefold()
-    matches = sorted({n for n in names if " ".join(n.split()).casefold() == want})
-    if len(matches) > 1:
-        raise ValueError(
-            f"panel name {panel!r} matches several existing folders {matches}; use the exact spelling"
-        )
-    return matches[0] if matches else panel
+    who = resolve_user_folder(user, destination_bucket=destination_bucket,
+                              destination_prefix=destination_prefix, s3=client)
+    root = f"{_clean_prefix(destination_prefix)}{who}/"
+    return _match_folder(panel, _list_folders(client, destination_bucket, root), "panel name")
 
 
 def _panel_folder(
     panel_name: str, client: Any | None, bucket: str, prefix: str, user: str | None = None
-) -> tuple[str, str | None]:
-    """resolve_panel_folder, but a listing failure falls back to the name as given plus a warning.
+) -> tuple[str, str | None, str]:
+    """Resolve (panel folder, warning, user folder) against what already exists in S3.
 
-    A backup should not be blocked just because listing is not permitted; the warning says the
-    folder was not matched against existing spellings. Ambiguity (ValueError) still raises.
+    A listing failure falls back to the names as given plus a warning, because a backup should not be
+    blocked just because listing is not permitted. Ambiguity (ValueError) still raises. Callers must
+    build the key with the returned user folder, so a 'nbhan' caller lands in the existing 'NBHAN' folder.
     """
     panel = _require_panel(panel_name)
     if client is None:
-        return panel, "panel folder not matched against existing folders (no S3 client)"
+        return panel, "folders not matched against existing folders (no S3 client)", resolve_user(user)
     try:
-        return resolve_panel_folder(panel, user=user, destination_bucket=bucket,
-                                    destination_prefix=prefix, s3=client), None
+        who = resolve_user_folder(user, destination_bucket=bucket, destination_prefix=prefix, s3=client)
+        root = f"{_clean_prefix(prefix)}{who}/"
+        return _match_folder(panel, _list_folders(client, bucket, root), "panel name"), None, who
     except (ClientError, BotoCoreError) as exc:
-        return panel, f"panel folder not matched against existing folders ({type(exc).__name__})"
+        return (panel, f"folders not matched against existing folders ({type(exc).__name__})",
+                resolve_user(user))
+
 
 
 # ----------------------------------------------------------------- backup
@@ -258,8 +298,9 @@ def copy_created_object_to_recovery(
 
     client = s3 or boto3.client("s3")
     filename = posixpath.basename(source_key)
-    panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix, user)
-    dest_key = build_destination_key(source_key, panel_folder, user, destination_prefix)
+    panel_folder, panel_warning, user_folder = _panel_folder(
+        panel_name, client, destination_bucket, destination_prefix, user)
+    dest_key = build_destination_key(source_key, panel_folder, user_folder, destination_prefix)
     relative_dest = dest_key[len(_clean_prefix(destination_prefix)):]
 
     source_meta = _head_object(client, source_bucket, source_key)
@@ -397,12 +438,13 @@ def upload_to_recovery(
     if not destination_bucket:
         raise ValueError("destination_bucket is required")
 
-    panel_folder, panel_warning = _require_panel(panel_name), None
+    panel_folder, panel_warning, user_folder = _require_panel(panel_name), None, resolve_user(user)
     client = s3
     if match_existing_folder and (not dry_run or s3 is not None):
         client = s3 or boto3.client("s3")
-        panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix, user)
-    key = build_destination_key(name, panel_folder, user, destination_prefix)
+        panel_folder, panel_warning, user_folder = _panel_folder(
+            panel_name, client, destination_bucket, destination_prefix, user)
+    key = build_destination_key(name, panel_folder, user_folder, destination_prefix)
     rel = key[len(_clean_prefix(destination_prefix)):]
     sha = hashlib.sha256(body).hexdigest()
     base = {"filename": name, "recovery_path": rel, "size_bytes": len(body), "sha256": sha,
@@ -450,7 +492,8 @@ def list_recoveries(
     _require_panel(panel_name)
     client = s3 or boto3.client("s3")
     root = _clean_prefix(destination_prefix)
-    who = resolve_user(user)
+    who = resolve_user_folder(user, destination_bucket=destination_bucket,
+                              destination_prefix=destination_prefix, s3=client)
     panel = resolve_panel_folder(panel_name, user=who, destination_bucket=destination_bucket,
                                  destination_prefix=destination_prefix, s3=client)
     prefix = f"{root}{who}/{panel}/"
@@ -619,12 +662,15 @@ def selfcheck(
     def s_list():
         nonlocal client
         client = client or boto3.client("s3")
-        folder = resolve_panel_folder(panel_name, user=user, destination_bucket=destination_bucket,
+        who = resolve_user_folder(user, destination_bucket=destination_bucket,
+                                  destination_prefix=destination_prefix, s3=client)
+        folder = resolve_panel_folder(panel_name, user=who, destination_bucket=destination_bucket,
                                       destination_prefix=destination_prefix, s3=client)
-        state["key"] = build_destination_key("selfcheck_probe.txt", folder, user, destination_prefix)
-        state["before"] = len(list_recoveries(panel_name, user=user, destination_bucket=destination_bucket,
+        state["key"] = build_destination_key("selfcheck_probe.txt", folder, who, destination_prefix)
+        state["user"] = who
+        state["before"] = len(list_recoveries(panel_name, user=who, destination_bucket=destination_bucket,
                                               destination_prefix=destination_prefix, s3=client))
-        return (f"list ok, user folder {resolve_user(user)!r}, panel folder {folder!r}, "
+        return (f"list ok, user folder {who!r}, panel folder {folder!r}, "
                 f"{state['before']} existing object(s)")
 
     def s_write():
@@ -640,7 +686,7 @@ def selfcheck(
         return f"wrote and verified {len(data)} bytes"
 
     def s_relist():
-        n = len(list_recoveries(panel_name, user=user, destination_bucket=destination_bucket,
+        n = len(list_recoveries(panel_name, user=state["user"], destination_bucket=destination_bucket,
                                 destination_prefix=destination_prefix, s3=client))
         if n != state["before"] + 1:
             raise RuntimeError(f"expected {state['before'] + 1} objects, saw {n}")
@@ -706,6 +752,7 @@ def sweep(
     found = sorted(root.rglob("*") if recursive else root.glob("*"))
     client = s3
     panel_folder = panel_name  # resolved once (case-insensitive) on the first real upload
+    user_folder = user  # likewise: the existing user folder spelling is looked up once
     resolved = False
     files: list[dict[str, Any]] = []
     counts = {"scanned": 0, "uploaded": 0, "would_upload": 0, "unchanged": 0, "failed": 0}
@@ -737,10 +784,11 @@ def sweep(
         try:
             client = client or boto3.client("s3")
             if not resolved:
-                panel_folder, _ = _panel_folder(panel_name, client, destination_bucket, destination_prefix, user)
+                panel_folder, _, user_folder = _panel_folder(
+                    panel_name, client, destination_bucket, destination_prefix, user)
                 resolved = True
             res = upload_to_recovery(
-                data, p.name, panel_name=panel_folder, user=user, s3=client,
+                data, p.name, panel_name=panel_folder, user=user_folder, s3=client,
                 destination_bucket=destination_bucket, destination_prefix=destination_prefix,
                 match_existing_folder=False,
             )

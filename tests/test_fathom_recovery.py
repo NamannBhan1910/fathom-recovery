@@ -505,6 +505,73 @@ class CaseInsensitivePanel(unittest.TestCase):
         self.assertEqual(r["panel_folder"], "Daily Checklist Equities")
         self.assertFalse(any(k.startswith("6_Recovery/tester/daily checklist equities/") for (_, k) in s3.objs))
 
+    # ---- user folder is matched case-insensitively (v1.6.1) ----
+    def us(self):
+        s3 = FakeS3()
+        s3.seed("rec", "6_Recovery/NBHAN/Daily Checklist/20261027T100000Z-aaaaaaaa/f.csv", b"old")
+        s3.seed("rec", "6_Recovery/other/Daily Checklist/20261027T100000Z-bbbbbbbb/f.csv", b"o")
+        return s3
+
+    def test_layout_marker(self):
+        self.assertEqual(fr.LAYOUT, "user/panel")
+
+    def test_user_folder_matches_ignoring_case(self):
+        s3 = self.us()
+        for given in ("nbhan", "NbHaN", "NBHAN", "nbhan@corp.com"):
+            self.assertEqual(fr.resolve_user_folder(given, destination_bucket="rec", s3=s3), "NBHAN", given)
+        self.assertEqual(fr.resolve_user_folder("newuser", destination_bucket="rec", s3=s3), "newuser")
+
+    def test_user_folder_ambiguous_raises_but_exact_wins(self):
+        s3 = self.us()
+        s3.seed("rec", "6_Recovery/nbhan/P/r/f.csv", b"x")
+        with self.assertRaises(ValueError):
+            fr.resolve_user_folder("NbHaN", destination_bucket="rec", s3=s3)
+        self.assertEqual(fr.resolve_user_folder("nbhan", destination_bucket="rec", s3=s3), "nbhan")
+        self.assertEqual(fr.resolve_user_folder("NBHAN", destination_bucket="rec", s3=s3), "NBHAN")
+
+    def test_upload_lowercase_user_lands_in_existing_user_folder(self):
+        s3 = self.us()
+        r = fr.upload_to_recovery(b"a\n", "x.csv", panel_name="daily checklist", user="nbhan",
+                                  destination_bucket="rec", s3=s3)
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["recovery_path"].startswith("NBHAN/Daily Checklist/"), r["recovery_path"])
+        self.assertFalse([k for (_, k) in s3.objs if k.startswith("6_Recovery/nbhan/")])
+
+    def test_list_and_selfcheck_use_existing_user_folder(self):
+        s3 = self.us()
+        rows = fr.list_recoveries("Daily Checklist", user="nbhan", destination_bucket="rec", s3=s3)
+        self.assertEqual([r["recovery_path"] for r in rows], ["NBHAN/Daily Checklist/20261027T100000Z-aaaaaaaa/f.csv"])
+        self.assertEqual(rows[0]["user"], "NBHAN")
+        res = fr.selfcheck("daily checklist", user="nbhan", apply=True, destination_bucket="rec", s3=s3)
+        self.assertTrue(res["ok"], res)
+        probes = [k for (_, k) in s3.objs if k.endswith("selfcheck_probe.txt")]
+        self.assertEqual(len(probes), 1)
+        self.assertTrue(probes[0].startswith("6_Recovery/NBHAN/Daily Checklist/"), probes)
+
+    def test_sweep_lowercase_user_lands_in_existing_user_folder(self):
+        import tempfile
+        from pathlib import Path
+        s3 = self.us()
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "a.csv").write_text("1\n")
+            Path(d, "b.json").write_text("{}")
+            r = fr.sweep(d, "DAILY checklist", user="nbhan", apply=True, destination_bucket="rec", s3=s3)
+            self.assertEqual((r["uploaded"], r["failed"]), (2, 0), r)
+        new = [k for (_, k) in s3.objs if k.endswith(("a.csv", "b.json"))]
+        self.assertEqual(len(new), 2)
+        self.assertTrue(all(k.startswith("6_Recovery/NBHAN/Daily Checklist/") for k in new), new)
+
+    def test_user_listing_failure_falls_back_with_warning(self):
+        from botocore.exceptions import ClientError as CE
+
+        class Denied(FakeS3):
+            def get_paginator(self, name):
+                raise CE({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
+        r = fr.upload_to_recovery(b"a\n", "x.csv", panel_name="P", user="nbhan",
+                                  destination_bucket="rec", s3=Denied())
+        self.assertTrue(r["recovery_path"].startswith("nbhan/P/"), r)
+        self.assertIn("warning", r)
+
     def test_dry_run_reports_matched_folder_and_writes_nothing(self):
         s3 = self.fs()
         n = len(s3.objs)
