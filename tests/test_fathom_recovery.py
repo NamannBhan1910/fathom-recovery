@@ -538,6 +538,159 @@ class CaseInsensitivePanel(unittest.TestCase):
                 fr.resolve_panel_folder(bad, destination_bucket="rec", s3=s3)
 
 
+class PanelConfigAndInstructions(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.d = __import__("pathlib").Path(self._td.name)
+
+    def test_init_writes_config_and_instructions(self):
+        r = fr.init_panel("daily checklist brokerage", "outputs", directory=self.d)
+        self.assertTrue(r["ok"])
+        cfg = __import__("json").loads((self.d / "recovery_config.json").read_text())
+        self.assertEqual(cfg, {"panel_name": "daily checklist brokerage", "output_dir": "outputs"})
+        ins = (self.d / "RECOVERY_INSTRUCTIONS.md").read_text()
+        self.assertIn("sweep --config recovery_config.json --apply", ins)
+        self.assertIn("daily checklist brokerage", ins)
+        self.assertIn("Nothing uploads by itself", ins)
+
+    def test_init_normalises_spaces_and_stores_patterns(self):
+        fr.init_panel("  My   Panel ", "out", directory=self.d, patterns=["*.csv"])
+        cfg = __import__("json").loads((self.d / "recovery_config.json").read_text())
+        self.assertEqual((cfg["panel_name"], cfg["patterns"]), ("My Panel", ["*.csv"]))
+
+    def test_init_refuses_overwrite_unless_force(self):
+        fr.init_panel("A", directory=self.d)
+        with self.assertRaises(ValueError):
+            fr.init_panel("B", directory=self.d)
+        self.assertIn('"A"', (self.d / "recovery_config.json").read_text())
+        fr.init_panel("B", directory=self.d, force=True)
+        self.assertIn('"B"', (self.d / "recovery_config.json").read_text())
+
+    def test_init_rejects_bad_names_and_writes_nothing(self):
+        for bad in ("", "..", "<Panel>"):
+            with self.assertRaises(ValueError, msg=bad):
+                fr.init_panel(bad, directory=self.d)
+        self.assertEqual(list(self.d.iterdir()), [])
+
+    def test_load_config_resolves_output_dir_next_to_config(self):
+        fr.init_panel("P", "outputs", directory=self.d)
+        cfg = fr.load_config(self.d / "recovery_config.json")
+        self.assertEqual(cfg["output_dir_resolved"], str((self.d / "outputs").resolve()))
+
+    def test_load_config_errors(self):
+        p = self.d / "recovery_config.json"
+        with self.assertRaises(ValueError):
+            fr.load_config(p)  # missing
+        p.write_text("not json")
+        with self.assertRaises(ValueError):
+            fr.load_config(p)
+        p.write_text('{"panel_name": "<Panel Name>"}')
+        with self.assertRaises(ValueError):
+            fr.load_config(p)  # placeholder
+        p.write_text('{"panel_name": "P", "patterns": "*.csv"}')
+        with self.assertRaises(ValueError):
+            fr.load_config(p)  # patterns must be a list
+
+    def _cli(self, *args, cwd=None):
+        import subprocess
+        root = __import__("pathlib").Path(__file__).resolve().parent.parent
+        env = dict(os.environ, RECOVERY_USER="tester")
+        return subprocess.run([sys.executable, str(root / "fathom_recovery.py"), *args], cwd=cwd,
+                              capture_output=True, text=True, env=env)
+
+    def test_cli_init_then_sweep_config_dry_run_from_other_folder(self):
+        r = self._cli("init", "--panel-name", "Cfg Panel", "--directory", str(self.d))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        (self.d / "outputs").mkdir()
+        (self.d / "outputs" / "a.csv").write_text("x\n1\n")
+        other = self.d / "elsewhere"
+        other.mkdir()
+        # dry run, run from a DIFFERENT folder: the config path alone must be enough
+        r = self._cli("sweep", "--config", str(self.d / "recovery_config.json"), cwd=other)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        d = __import__("json").loads(r.stdout)
+        self.assertEqual((d["scanned"], d["would_upload"], d["uploaded"]), (1, 1, 0))
+
+    def test_cli_sweep_config_creates_missing_output_dir(self):
+        self._cli("init", "--panel-name", "Cfg Panel", "--directory", str(self.d))
+        self.assertFalse((self.d / "outputs").exists())
+        r = self._cli("sweep", "--config", str(self.d / "recovery_config.json"))
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue((self.d / "outputs").is_dir())
+        self.assertEqual(__import__("json").loads(r.stdout)["scanned"], 0)
+
+    def test_cli_sweep_needs_panel_or_config(self):
+        r = self._cli("sweep", "--dir", str(self.d))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--panel-name or --config", r.stdout)
+
+    def test_cli_explicit_args_override_config(self):
+        self._cli("init", "--panel-name", "From Config", "--directory", str(self.d))
+        (self.d / "other").mkdir()
+        (self.d / "other" / "b.csv").write_text("y\n")
+        r = self._cli("sweep", "--config", str(self.d / "recovery_config.json"),
+                      "--dir", str(self.d / "other"), "--pattern", "*.csv")
+        d = __import__("json").loads(r.stdout)
+        self.assertEqual([f["file"] for f in d["files"]], ["b.csv"])
+
+    def test_sync_with_panel_name_writes_files_and_upgrade_keeps_config(self):
+        import json
+        import shutil
+        import subprocess
+        root = __import__("pathlib").Path(__file__).resolve().parent.parent
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        ident = ["-c", "user.name=t", "-c", "user.email=t@e.com"]
+        repo = self.d / "repo"
+        repo.mkdir()
+        for f in ("fathom_recovery.py", "sync_recovery.py"):
+            shutil.copy(root / f, repo)
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", *ident, "add", "-A"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", *ident, "commit", "-q", "-m", "x"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", *ident, "tag", "v9.9.9"], cwd=repo, check=True, env=env)
+        panel = self.d / "panel"
+        panel.mkdir()
+
+        def run(*extra):
+            return subprocess.run([sys.executable, str(root / "sync_recovery.py"), "--repo", str(repo), "--ref", "v9.9.9",
+                                   "--dest", "scripts", "--panel-name", "Sync Panel", *extra],
+                                  cwd=panel, capture_output=True, text=True, env=env)
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertTrue((panel / "scripts" / "fathom_recovery.py").is_file())
+        self.assertEqual(json.loads((panel / "recovery_config.json").read_text())["panel_name"], "Sync Panel")
+        self.assertTrue((panel / "RECOVERY_INSTRUCTIONS.md").is_file())
+        # upgrade: rerun with an edited config; it must stay, and the install must still succeed
+        (panel / "recovery_config.json").write_text('{"panel_name": "Edited", "output_dir": "data"}')
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(json.loads(r.stdout)["init"]["action"], "kept_existing_config")
+        self.assertIn("Edited", (panel / "recovery_config.json").read_text())
+
+    def test_sync_without_panel_name_writes_no_config(self):
+        import subprocess
+        import shutil
+        root = __import__("pathlib").Path(__file__).resolve().parent.parent
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        ident = ["-c", "user.name=t", "-c", "user.email=t@e.com"]
+        repo = self.d / "repo2"
+        repo.mkdir()
+        shutil.copy(root / "fathom_recovery.py", repo)
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", *ident, "add", "-A"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", *ident, "commit", "-q", "-m", "x"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", *ident, "tag", "v9.9.9"], cwd=repo, check=True, env=env)
+        panel = self.d / "panel2"
+        panel.mkdir()
+        r = subprocess.run([sys.executable, str(root / "sync_recovery.py"), "--repo", str(repo), "--ref", "v9.9.9",
+                            "--dest", "scripts"], cwd=panel, capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertFalse((panel / "recovery_config.json").exists())
+
+
+
 
 class Defaults(unittest.TestCase):
     def test_target_defaults(self):

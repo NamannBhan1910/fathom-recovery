@@ -7,7 +7,7 @@ that panel's generation code. Every panel writes to its own folder:
     s3://<bucket>/6_Recovery/<Panel Name>/<user>/<YYYYMMDDTHHMMSSZ>-<8 hex>/<filename>
 
 * <Panel Name>  REQUIRED. Supplied by the user / caller at execution time.
-                Matching is exact (case and spaces matter).
+                Matched to an existing folder ignoring case and extra spaces.
 * <user>        explicit arg > RECOVERY_USER env > bridge.whoami() > "unknown-user"
 * timestamp-id  UTC time of the copy + random 8 hex. Unique per copy: nothing is
                 ever overwritten, every version is kept.
@@ -37,6 +37,7 @@ CLI (dry run unless --apply is given)
     python3 fathom_recovery.py copy    --panel-name "<Panel>" --source-bucket B --source-key K [--user U] [--apply]
     python3 fathom_recovery.py upload  --panel-name "<Panel>" --file local.csv [--filename N] [--user U] [--apply]
     python3 fathom_recovery.py sweep   --panel-name "<Panel>" [--dir .] [--pattern "*.csv"] [--apply]
+    python3 fathom_recovery.py sweep   --config recovery_config.json [--apply]   # panel/folder from the config
     python3 fathom_recovery.py list    --panel-name "<Panel>" [--user U]
     python3 fathom_recovery.py restore --recovery-path "<Panel>/<user>/<run>/<file>" \
                                        --target-bucket B --target-key K [--overwrite] [--apply]
@@ -50,6 +51,7 @@ import fnmatch
 import hashlib
 import json
 import mimetypes
+mimetypes.add_type("text/csv", ".csv", strict=True)
 import os
 import posixpath
 import re
@@ -61,7 +63,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 DESTINATION_BUCKET = os.environ.get("RECOVERY_DESTINATION_BUCKET", "mosaic-derivatives-margining")
 DESTINATION_PREFIX = os.environ.get("RECOVERY_DESTINATION_PREFIX", "6_Recovery/")
@@ -707,6 +709,88 @@ def sweep(
     return {"ok": counts["failed"] == 0, "action": "sweep", "applied": apply, **counts, "files": files}
 
 
+# ------------------------------------------------- panel config + instruction
+CONFIG_NAME = "recovery_config.json"
+INSTRUCTIONS_NAME = "RECOVERY_INSTRUCTIONS.md"
+
+
+def load_config(path: str | os.PathLike) -> dict[str, Any]:
+    """Read recovery_config.json: {"panel_name": ..., "output_dir": ..., "patterns": [...] (optional)}.
+
+    A relative output_dir is resolved against the config file's own folder, so the same config
+    works no matter which folder the command is run from.
+    """
+    p = Path(path)
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read config {str(p)!r}: {exc}") from exc
+    if not isinstance(cfg, dict):
+        raise ValueError("config must be a JSON object")
+    _require_panel(cfg.get("panel_name"))
+    out = Path(str(cfg.get("output_dir") or "outputs"))
+    cfg["output_dir_resolved"] = str(out if out.is_absolute() else (p.resolve().parent / out))
+    pats = cfg.get("patterns")
+    if pats is not None and not (isinstance(pats, list) and all(isinstance(x, str) for x in pats)):
+        raise ValueError("config 'patterns' must be a list of glob strings")
+    return cfg
+
+
+def render_instructions(panel_name: str, output_dir: str = "outputs", config_path: str = CONFIG_NAME) -> str:
+    """The standing instruction for a panel's agent. Uses the config file, so it never hard-codes the panel."""
+    panel = " ".join(str(panel_name).split())
+    return f"""# Recovery backup for this panel
+
+Panel name: "{panel}"   (set in {config_path}; case and extra spaces do not matter)
+Data folder: {output_dir}
+
+Rule (follow it every time, without being asked):
+
+1. Whenever you create or change a data file in this panel (csv, xlsx, xls, json, parquet, txt),
+   as the LAST step of that task run:
+
+       python3 scripts/fathom_recovery.py sweep --config {config_path} --apply
+
+   then tell me how many files were uploaded, unchanged, or failed.
+2. At the start of every session, run the same command once. It uploads anything a previous
+   run missed and skips files that are already uploaded.
+3. If it reports a failure or AccessDenied, tell me. Do not retry silently or skip it.
+4. Never delete anything in S3 and never edit {config_path} yourself unless I ask.
+
+Files land in S3 under 6_Recovery/<panel folder>/<user>/<timestamp>-<8 hex>/<file>.
+Nothing uploads by itself: this rule is what triggers the upload.
+"""
+
+
+def init_panel(
+    panel_name: str,
+    output_dir: str = "outputs",
+    *,
+    directory: str | os.PathLike = ".",
+    patterns: list[str] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Write recovery_config.json and RECOVERY_INSTRUCTIONS.md into `directory` (local files only, no S3).
+
+    Refuses to overwrite an existing config unless force=True.
+    """
+    panel = " ".join(_require_panel(panel_name).split())
+    d = Path(directory)
+    d.mkdir(parents=True, exist_ok=True)
+    cfg_path, ins_path = d / CONFIG_NAME, d / INSTRUCTIONS_NAME
+    if cfg_path.exists() and not force:
+        raise ValueError(f"{CONFIG_NAME} already exists in {str(d)!r}; use --force to replace it")
+    cfg: dict[str, Any] = {"panel_name": panel, "output_dir": output_dir}
+    if patterns:
+        cfg["patterns"] = list(patterns)
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    ins_path.write_text(render_instructions(panel, output_dir, CONFIG_NAME), encoding="utf-8")
+    return {
+        "ok": True, "action": "init", "panel_name": panel, "output_dir": output_dir,
+        "config_file": str(cfg_path), "instructions_file": str(ins_path),
+        "next": f"give the contents of {INSTRUCTIONS_NAME} to this panel's agent as a standing instruction",
+    }
+
 
 # --------------------------------------------------------------------- CLI
 def build_parser() -> argparse.ArgumentParser:
@@ -748,8 +832,11 @@ def build_parser() -> argparse.ArgumentParser:
     common(u)
 
     sw = sub.add_parser("sweep", help="upload new/changed files in a folder (dry run unless --apply)")
-    sw.add_argument("--panel-name", required=True)
-    sw.add_argument("--dir", default=".", help="folder to scan (default: current folder)")
+    sw.add_argument("--panel-name", default=None, help="required unless --config is given")
+    sw.add_argument("--config", default=None,
+                    help="recovery_config.json (panel_name, output_dir, optional patterns); "
+                         "explicit --panel-name/--dir/--pattern override it")
+    sw.add_argument("--dir", default=None, help="folder to scan (default: output_dir from --config, else .)")
     sw.add_argument("--pattern", action="append", default=None,
                     help="glob such as *.csv (repeatable; default: csv, xlsx, xls, json, parquet, txt)")
     sw.add_argument("--no-recursive", action="store_true")
@@ -757,6 +844,13 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument("--user", default=None)
     sw.add_argument("--apply", action="store_true", help="actually upload (default is dry run)")
     common(sw)
+
+    ini = sub.add_parser("init", help="write recovery_config.json + RECOVERY_INSTRUCTIONS.md (local files only)")
+    ini.add_argument("--panel-name", required=True)
+    ini.add_argument("--output-dir", default="outputs", help="folder this panel writes data files to")
+    ini.add_argument("--directory", default=".", help="where to write the two files (default: current folder)")
+    ini.add_argument("--pattern", action="append", default=None, help="optional glob; repeatable")
+    ini.add_argument("--force", action="store_true", help="replace an existing recovery_config.json")
 
     sc = sub.add_parser("selfcheck", help="health check for a panel (read-only unless --apply)")
     sc.add_argument("--panel-name", required=True)
@@ -791,12 +885,23 @@ def main(argv: list[str] | None = None) -> int:
                 destination_bucket=args.destination_bucket, destination_prefix=args.destination_prefix,
             )
         elif args.cmd == "sweep":
+            cfg = load_config(args.config) if args.config else {}
+            panel = args.panel_name or cfg.get("panel_name")
+            if not panel:
+                raise ValueError("sweep needs --panel-name or --config")
+            scan_dir = args.dir or cfg.get("output_dir_resolved") or "."
+            if not args.dir and cfg.get("output_dir_resolved"):
+                os.makedirs(scan_dir, exist_ok=True)  # panel may not have generated anything yet
             result = sweep(
-                args.dir, args.panel_name, patterns=args.pattern or SWEEP_DEFAULT_PATTERNS,
+                scan_dir, panel,
+                patterns=args.pattern or cfg.get("patterns") or SWEEP_DEFAULT_PATTERNS,
                 recursive=not args.no_recursive, state_path=args.state_file, user=args.user,
                 apply=args.apply, destination_bucket=args.destination_bucket,
                 destination_prefix=args.destination_prefix,
             )
+        elif args.cmd == "init":
+            result = init_panel(args.panel_name, args.output_dir, directory=args.directory,
+                                patterns=args.pattern, force=args.force)
         elif args.cmd == "selfcheck":
             result = selfcheck(
                 args.panel_name, user=args.user, apply=args.apply,
@@ -809,7 +914,8 @@ def main(argv: list[str] | None = None) -> int:
                 destination_prefix=args.destination_prefix,
             )
             result["target_bucket_redacted"] = _redact(args.target_bucket)
-        result["destination_bucket_redacted"] = _redact(args.destination_bucket)
+        if hasattr(args, "destination_bucket"):  # `init` is local-only and has no bucket option
+            result["destination_bucket_redacted"] = _redact(args.destination_bucket)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result.get("ok") else 1
     except (ClientError, BotoCoreError, ValueError) as exc:

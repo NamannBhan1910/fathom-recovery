@@ -61,6 +61,32 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
+### Making a panel upload new files (v1.5.0+)
+
+Nothing in this repo watches for files or runs by itself. What it does give you is a standing
+instruction for the panel's agent, plus a config file so the command is the same in every panel:
+
+```
+python3 sync_recovery.py --repo <git url> --ref v1.5.0 --dest scripts --run-tests \
+    --panel-name "<Panel>" --output-dir outputs
+```
+
+This installs `scripts/fathom_recovery.py` and writes two local files in the current folder:
+
+- `recovery_config.json` - `{"panel_name": ..., "output_dir": ...}`
+- `RECOVERY_INSTRUCTIONS.md` - the rule for the panel's agent: after creating or changing a data
+  file, run `python3 scripts/fathom_recovery.py sweep --config recovery_config.json --apply`, and
+  run it once at the start of each session.
+
+Give the contents of `RECOVERY_INSTRUCTIONS.md` to the panel's agent as a standing instruction.
+It works only as long as the agent follows it; a missed run leaves files local until the next sweep.
+`sweep` uploads only new or changed files, so running it extra times is safe. For uploads that do
+not depend on the agent, run the same `sweep --config` command on a schedule.
+
+Re-running the install on a panel that already has `recovery_config.json` upgrades the code and
+keeps the config. `init` alone (`fathom_recovery.py init --panel-name "<Panel>"`) writes just the two
+files and never touches S3.
+
 ## Finding and restoring
 
 ```
@@ -81,7 +107,8 @@ Offline only; nothing touches S3.
 
 ## Rules of thumb
 
-- A panel is only protected once its generation code calls the helper.
+- A panel is only protected once something calls the helper: its generation code, its agent following
+  `RECOVERY_INSTRUCTIONS.md`, or a schedule.
 - Case and extra spaces in the panel name don't matter (v1.4.0+), but a typo still creates a new folder.
 - The helper never deletes anything. Retention/cleanup, if wanted, should be an S3 lifecycle rule on `6_Recovery/`.
 - Needs AWS credentials with `s3:GetObject` and `s3:PutObject` on the source and recovery locations, and `s3:ListBucket` for `list`.
@@ -113,7 +140,7 @@ Spelling matters except for case and extra spaces. Add a row before a panel star
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.2.0 --dest scripts --run-tests
+python3 sync_recovery.py --repo <git url> --ref v1.5.0 --dest scripts --run-tests --panel-name "<Panel>"
 ```
 Prints the installed version, commit and sha256. Pin a tag, not `main`.
 To upgrade a panel, rerun with the new tag.
