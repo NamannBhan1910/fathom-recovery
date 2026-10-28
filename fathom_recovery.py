@@ -4,11 +4,12 @@
 Copy this one file into any panel workspace (needs only boto3) and call it from
 that panel's generation code. Every panel writes to its own folder:
 
-    s3://<bucket>/6_Recovery/<Panel Name>/<user>/<YYYYMMDDTHHMMSSZ>-<8 hex>/<filename>
+    s3://<bucket>/6_Recovery/<user>/<Panel Name>/<YYYYMMDDTHHMMSSZ>-<8 hex>/<filename>
 
+* <user>        explicit arg > RECOVERY_USER env > bridge.whoami() > "unknown-user".
+                Files are segregated per user first, then per panel.
 * <Panel Name>  REQUIRED. Supplied by the user / caller at execution time.
-                Matched to an existing folder ignoring case and extra spaces.
-* <user>        explicit arg > RECOVERY_USER env > bridge.whoami() > "unknown-user"
+                Matched to an existing folder of THAT user ignoring case and extra spaces.
 * timestamp-id  UTC time of the copy + random 8 hex. Unique per copy: nothing is
                 ever overwritten, every version is kept.
 * Every recovery object gets `sha256` metadata (hash of the source bytes).
@@ -39,7 +40,7 @@ CLI (dry run unless --apply is given)
     python3 fathom_recovery.py sweep   --panel-name "<Panel>" [--dir .] [--pattern "*.csv"] [--apply]
     python3 fathom_recovery.py sweep   --config recovery_config.json [--apply]   # panel/folder from the config
     python3 fathom_recovery.py list    --panel-name "<Panel>" [--user U]
-    python3 fathom_recovery.py restore --recovery-path "<Panel>/<user>/<run>/<file>" \
+    python3 fathom_recovery.py restore --recovery-path "<user>/<Panel>/<run>/<file>" \
                                        --target-bucket B --target-key K [--overwrite] [--apply]
 
 Output never prints bucket names (they are redacted).
@@ -63,7 +64,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 REPO_URL = "https://github.com/NamannBhan1910/fathom-recovery.git"
 
 DESTINATION_BUCKET = os.environ.get("RECOVERY_DESTINATION_BUCKET", "mosaic-derivatives-margining")
@@ -135,7 +136,7 @@ def build_destination_key(
     if not filename:
         raise ValueError("source_key must include a filename")
     panel = _safe_segment(panel_name, "panel_name")
-    return f"{_clean_prefix(destination_prefix)}{panel}/{resolve_user(user)}/{make_run_folder(now)}/{filename}"
+    return f"{_clean_prefix(destination_prefix)}{resolve_user(user)}/{panel}/{make_run_folder(now)}/{filename}"
 
 
 def _is_not_found(exc: ClientError) -> bool:
@@ -182,14 +183,15 @@ def _require_panel(panel_name: Any) -> str:
 def resolve_panel_folder(
     panel_name: str,
     *,
+    user: str | None = None,
     destination_bucket: str = DESTINATION_BUCKET,
     destination_prefix: str = DESTINATION_PREFIX,
     s3: Any | None = None,
 ) -> str:
-    """Return the panel folder name to use, ignoring case and extra spaces (read-only).
+    """Return the panel folder name to use inside THIS USER's folder, ignoring case and extra spaces.
 
     S3 keys are case-sensitive, so 'daily checklist equities' would otherwise create a second
-    folder. This lists the folders under the recovery prefix:
+    folder. This lists the panel folders under <prefix><user>/ (read-only):
       * exact spelling exists            -> use it
       * exactly one case-insensitive hit -> use that folder's spelling
       * several case-insensitive hits    -> ValueError (ambiguous; use the exact spelling)
@@ -197,7 +199,7 @@ def resolve_panel_folder(
     """
     panel = _require_panel(panel_name)
     client = s3 or boto3.client("s3")
-    root = _clean_prefix(destination_prefix)
+    root = f"{_clean_prefix(destination_prefix)}{resolve_user(user)}/"
     names: list[str] = []
     for page in client.get_paginator("list_objects_v2").paginate(
         Bucket=destination_bucket, Prefix=root, Delimiter="/"
@@ -216,7 +218,7 @@ def resolve_panel_folder(
 
 
 def _panel_folder(
-    panel_name: str, client: Any | None, bucket: str, prefix: str
+    panel_name: str, client: Any | None, bucket: str, prefix: str, user: str | None = None
 ) -> tuple[str, str | None]:
     """resolve_panel_folder, but a listing failure falls back to the name as given plus a warning.
 
@@ -227,7 +229,8 @@ def _panel_folder(
     if client is None:
         return panel, "panel folder not matched against existing folders (no S3 client)"
     try:
-        return resolve_panel_folder(panel, destination_bucket=bucket, destination_prefix=prefix, s3=client), None
+        return resolve_panel_folder(panel, user=user, destination_bucket=bucket,
+                                    destination_prefix=prefix, s3=client), None
     except (ClientError, BotoCoreError) as exc:
         return panel, f"panel folder not matched against existing folders ({type(exc).__name__})"
 
@@ -255,7 +258,7 @@ def copy_created_object_to_recovery(
 
     client = s3 or boto3.client("s3")
     filename = posixpath.basename(source_key)
-    panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix)
+    panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix, user)
     dest_key = build_destination_key(source_key, panel_folder, user, destination_prefix)
     relative_dest = dest_key[len(_clean_prefix(destination_prefix)):]
 
@@ -373,7 +376,7 @@ def upload_to_recovery(
               NOTE: a plain str is treated as CONTENT; pass pathlib.Path for a file.
     filename  name stored in S3; defaults to the local file's name when data is a path.
 
-    Writes <prefix><panel>/<user>/<timestamp>-<8 hex>/<filename> with sha256 metadata,
+    Writes <prefix><user>/<panel>/<timestamp>-<8 hex>/<filename> with sha256 metadata,
     then verifies size, stored sha256 and the content hash read back from S3.
     panel_name and filename are validated BEFORE anything is written.
     """
@@ -398,7 +401,7 @@ def upload_to_recovery(
     client = s3
     if match_existing_folder and (not dry_run or s3 is not None):
         client = s3 or boto3.client("s3")
-        panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix)
+        panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix, user)
     key = build_destination_key(name, panel_folder, user, destination_prefix)
     rel = key[len(_clean_prefix(destination_prefix)):]
     sha = hashlib.sha256(body).hexdigest()
@@ -437,17 +440,20 @@ def list_recoveries(
     destination_prefix: str = DESTINATION_PREFIX,
     s3: Any | None = None,
 ) -> list[dict[str, Any]]:
-    """List recovery copies for one panel (read-only), newest first.
+    """List recovery copies for one user's panel (read-only), newest first.
 
-    Understands the standard layout (panel/user/run/file) and older layouts
-    (panel/file, panel/user/file) - for those, user / run_id may be None.
+    Layout: <prefix><user>/<panel>/<run>/<file>. `user` defaults to the current user (resolve_user),
+    so a user only lists their own panel folder; pass user="other" to look at someone else's.
+    Older objects written before v1.6.0 sit under <prefix><panel>/<user>/<run>/<file>; they are not
+    mixed in here (see list_legacy_recoveries).
     """
     _require_panel(panel_name)
     client = s3 or boto3.client("s3")
     root = _clean_prefix(destination_prefix)
-    panel = resolve_panel_folder(panel_name, destination_bucket=destination_bucket,
+    who = resolve_user(user)
+    panel = resolve_panel_folder(panel_name, user=who, destination_bucket=destination_bucket,
                                  destination_prefix=destination_prefix, s3=client)
-    prefix = f"{root}{panel}/" + (f"{_safe_segment(user, 'user')}/" if user else "")
+    prefix = f"{root}{who}/{panel}/"
     out: list[dict[str, Any]] = []
     for page in client.get_paginator("list_objects_v2").paginate(Bucket=destination_bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -455,22 +461,66 @@ def list_recoveries(
             if key.endswith("/"):
                 continue  # folder marker
             rel = key[len(root):]
-            parts = rel.split("/")[1:]  # drop panel
-            if len(parts) >= 3:
-                who, run_id, fname = parts[0], parts[1], "/".join(parts[2:])
-            elif len(parts) == 2:
-                who, run_id, fname = parts[0], None, parts[1]
+            parts = rel.split("/")[2:]  # drop user, panel
+            if len(parts) >= 2:
+                run_id, fname = parts[0], "/".join(parts[1:])
             else:
-                who, run_id, fname = None, None, parts[0]
+                run_id, fname = None, parts[0]
             lm = obj.get("LastModified")
             out.append({
                 "recovery_path": rel,
                 "user": who,
+                "panel": panel,
                 "run_id": run_id,
                 "filename": fname,
                 "size_bytes": obj.get("Size"),
                 "last_modified_utc": lm.astimezone(timezone.utc).isoformat() if lm else None,
             })
+    out.sort(key=lambda r: (r["last_modified_utc"] or "", r["recovery_path"]), reverse=True)
+    return out
+
+
+def list_legacy_recoveries(
+    panel_name: str,
+    *,
+    user: str | None = None,
+    destination_bucket: str = DESTINATION_BUCKET,
+    destination_prefix: str = DESTINATION_PREFIX,
+    s3: Any | None = None,
+) -> list[dict[str, Any]]:
+    """List objects in the OLD panel-first layout <prefix><panel>/<user>/<run>/<file> (read-only).
+
+    Matches the panel folder ignoring case and spaces (exact listing of the top level). Optional `user`
+    filter. Nothing is moved or renamed; this only lets old data be found and restored.
+    """
+    panel = _require_panel(panel_name)
+    client = s3 or boto3.client("s3")
+    root = _clean_prefix(destination_prefix)
+    tops: list[str] = []
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=destination_bucket, Prefix=root, Delimiter="/"):
+        tops += [cp["Prefix"][len(root):].rstrip("/") for cp in page.get("CommonPrefixes", [])]
+    want = panel.casefold()
+    folders = [t for t in tops if " ".join(t.split()).casefold() == want]
+    out: list[dict[str, Any]] = []
+    for folder in folders:
+        prefix = f"{root}{folder}/" + (f"{_safe_segment(user, 'user')}/" if user else "")
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=destination_bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):
+                    continue
+                rel = key[len(root):]
+                parts = rel.split("/")[1:]
+                if len(parts) >= 3:
+                    who, run_id, fname = parts[0], parts[1], "/".join(parts[2:])
+                elif len(parts) == 2:
+                    who, run_id, fname = parts[0], None, parts[1]
+                else:
+                    who, run_id, fname = None, None, parts[0]
+                lm = obj.get("LastModified")
+                out.append({"recovery_path": rel, "user": who, "panel": folder, "run_id": run_id,
+                            "filename": fname, "size_bytes": obj.get("Size"),
+                            "last_modified_utc": lm.astimezone(timezone.utc).isoformat() if lm else None})
     out.sort(key=lambda r: (r["last_modified_utc"] or "", r["recovery_path"]), reverse=True)
     return out
 
@@ -495,7 +545,7 @@ def restore_from_recovery(
         raise ValueError("target_bucket and target_key are required")
     segs = [s for s in (recovery_path or "").split("/")]
     if len(segs) < 2 or any(s in {"", ".", ".."} for s in segs):
-        raise ValueError("recovery_path must look like '<Panel>/<user>/<run>/<file>' with no empty or '..' parts")
+        raise ValueError("recovery_path must look like '<user>/<Panel>/<run>/<file>' with no empty or '..' parts")
 
     client = s3 or boto3.client("s3")
     src_key = f"{_clean_prefix(destination_prefix)}{recovery_path}"
@@ -546,7 +596,7 @@ def selfcheck(
 
     Steps: panel name valid -> can list the panel folder -> (apply) write a tiny
     probe file and verify size + sha256 -> (apply) list sees the probe.
-    The probe is written to <panel>/<user>/<run>/selfcheck_probe.txt and is never deleted.
+    The probe is written to <user>/<panel>/<run>/selfcheck_probe.txt and is never deleted.
     """
     steps: list[dict[str, Any]] = []
 
@@ -569,12 +619,13 @@ def selfcheck(
     def s_list():
         nonlocal client
         client = client or boto3.client("s3")
-        folder = resolve_panel_folder(panel_name, destination_bucket=destination_bucket,
+        folder = resolve_panel_folder(panel_name, user=user, destination_bucket=destination_bucket,
                                       destination_prefix=destination_prefix, s3=client)
         state["key"] = build_destination_key("selfcheck_probe.txt", folder, user, destination_prefix)
-        state["before"] = len(list_recoveries(panel_name, destination_bucket=destination_bucket,
+        state["before"] = len(list_recoveries(panel_name, user=user, destination_bucket=destination_bucket,
                                               destination_prefix=destination_prefix, s3=client))
-        return f"list ok, folder {folder!r}, {state['before']} existing object(s)"
+        return (f"list ok, user folder {resolve_user(user)!r}, panel folder {folder!r}, "
+                f"{state['before']} existing object(s)")
 
     def s_write():
         data = f"fathom_recovery selfcheck {datetime.now(timezone.utc).isoformat()}\n".encode()
@@ -589,7 +640,7 @@ def selfcheck(
         return f"wrote and verified {len(data)} bytes"
 
     def s_relist():
-        n = len(list_recoveries(panel_name, destination_bucket=destination_bucket,
+        n = len(list_recoveries(panel_name, user=user, destination_bucket=destination_bucket,
                                 destination_prefix=destination_prefix, s3=client))
         if n != state["before"] + 1:
             raise RuntimeError(f"expected {state['before'] + 1} objects, saw {n}")
@@ -686,7 +737,7 @@ def sweep(
         try:
             client = client or boto3.client("s3")
             if not resolved:
-                panel_folder, _ = _panel_folder(panel_name, client, destination_bucket, destination_prefix)
+                panel_folder, _ = _panel_folder(panel_name, client, destination_bucket, destination_prefix, user)
                 resolved = True
             res = upload_to_recovery(
                 data, p.name, panel_name=panel_folder, user=user, s3=client,
@@ -767,7 +818,7 @@ Rule (follow it every time, without being asked):
 3. If it reports a failure or AccessDenied, tell me. Do not retry silently or skip it.
 4. Never delete anything in S3 and never edit {config_path} yourself unless I ask.
 
-Files land in S3 under 6_Recovery/<panel folder>/<user>/<timestamp>-<8 hex>/<file>.
+Files land in S3 under 6_Recovery/<user>/<panel folder>/<timestamp>-<8 hex>/<file>.
 Nothing uploads by itself: this rule is what triggers the upload.
 """
 
@@ -823,6 +874,8 @@ def build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--panel-name", required=True)
     ls.add_argument("--user", default=None)
     ls.add_argument("--limit", type=int, default=50)
+    ls.add_argument("--legacy", action="store_true",
+                    help="list objects in the OLD <panel>/<user>/<run>/<file> layout (written before v1.6.0)")
     common(ls)
 
     r = sub.add_parser("restore", help="restore one recovery object to a target bucket/key")
@@ -881,11 +934,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             result["source_bucket_redacted"] = _redact(args.source_bucket)
         elif args.cmd == "list":
-            rows = list_recoveries(
+            lister = list_legacy_recoveries if args.legacy else list_recoveries
+            rows = lister(
                 args.panel_name, user=args.user,
                 destination_bucket=args.destination_bucket, destination_prefix=args.destination_prefix,
             )
-            result = {"ok": True, "panel": args.panel_name, "total": len(rows), "shown": rows[: args.limit]}
+            result = {"ok": True, "panel": args.panel_name, "layout": "legacy" if args.legacy else "user/panel",
+                      "total": len(rows), "shown": rows[: args.limit]}
         elif args.cmd == "upload":
             from pathlib import Path
 

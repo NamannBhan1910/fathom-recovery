@@ -68,7 +68,7 @@ class KeyLayout(unittest.TestCase):
     def test_layout(self):
         now = datetime(2026, 10, 27, 14, 45, 7, tzinfo=timezone.utc)
         k = fr.build_destination_key("a/b/report.csv", "Daily Checklist Brokerage", user="test-user", now=now)
-        self.assertRegex(k, r"^6_Recovery/Daily Checklist Brokerage/test-user/20261027T144507Z-[0-9a-f]{8}/report\.csv$")
+        self.assertRegex(k, r"^6_Recovery/test-user/Daily Checklist Brokerage/20261027T144507Z-[0-9a-f]{8}/report\.csv$")
 
     def test_unique_per_call(self):
         a = fr.build_destination_key("x.csv", "P", user="u")
@@ -78,18 +78,18 @@ class KeyLayout(unittest.TestCase):
     def test_panels_get_separate_folders(self):
         a = fr.build_destination_key("checklist_state.json", "Panel A", user="u")
         b = fr.build_destination_key("checklist_state.json", "Panel B", user="u")
-        self.assertTrue(a.startswith("6_Recovery/Panel A/"))
-        self.assertTrue(b.startswith("6_Recovery/Panel B/"))
+        self.assertTrue(a.startswith("6_Recovery/u/Panel A/"))
+        self.assertTrue(b.startswith("6_Recovery/u/Panel B/"))
 
     def test_name_is_exact(self):
         a = fr.build_destination_key("x.csv", "Daily Checklist Equities", user="u")
         b = fr.build_destination_key("x.csv", "daily checklist equities", user="u")
-        self.assertNotEqual(a.split("/")[1], b.split("/")[1])
+        self.assertNotEqual(a.split("/")[2], b.split("/")[2])
 
     def test_slashes_cannot_escape(self):
         k = fr.build_destination_key("x.csv", "../Evil/Panel", user="u")
         self.assertNotIn("..", k)
-        self.assertEqual(len(k.split("/")), 5)  # prefix/panel/user/run/file
+        self.assertEqual(len(k.split("/")), 5)  # prefix/user/panel/run/file
 
     def test_bad_panel_names(self):
         for bad in ["", "   ", "..", ".", None, "///"]:
@@ -114,7 +114,7 @@ class CopyAndPut(unittest.TestCase):
         cr = res["copy_result"]
         self.assertTrue(res["ok"])
         self.assertEqual(cr["action"], "copied")
-        self.assertTrue(cr["recovery_path"].startswith("Equities Checklist EU/tester/"))
+        self.assertTrue(cr["recovery_path"].startswith("tester/Equities Checklist EU/"))
         dest = s3.copies[0]
         self.assertEqual(s3.objs[("rec", dest)]["meta"]["sha256"], hashlib.sha256(data).hexdigest())
         self.assertEqual(s3.objs[("rec", dest)]["ct"], "text/csv")
@@ -150,26 +150,48 @@ class ListAndRestore(unittest.TestCase):
     def setUp(self):
         self.s3 = FakeS3()
         s = self.s3
-        s.seed("rec", "6_Recovery/Panel A/u1/20261027T100000Z-aaaaaaaa/f.csv", b"v1", meta={"sha256": hashlib.sha256(b"v1").hexdigest()})
-        s.seed("rec", "6_Recovery/Panel A/u2/20261027T110000Z-bbbbbbbb/f.csv", b"v2")
-        s.seed("rec", "6_Recovery/Panel A/legacy.csv", b"old")
-        s.seed("rec", "6_Recovery/Panel A/", b"")  # folder marker
-        s.seed("rec", "6_Recovery/Panel B/u1/20261027T120000Z-cccccccc/f.csv", b"other")
+        s.seed("rec", "6_Recovery/u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv", b"v1", meta={"sha256": hashlib.sha256(b"v1").hexdigest()})
+        s.seed("rec", "6_Recovery/u2/Panel A/20261027T110000Z-bbbbbbbb/f.csv", b"v2")
+        s.seed("rec", "6_Recovery/u1/Panel A/", b"")  # folder marker
+        s.seed("rec", "6_Recovery/u1/Panel B/20261027T120000Z-cccccccc/f.csv", b"other")
+        # objects written before v1.6.0, panel-first: <panel>/<user>/<run>/<file>
+        s.seed("rec", "6_Recovery/Panel A/u3/20261026T090000Z-dddddddd/old.csv", b"old")
+        s.seed("rec", "6_Recovery/Panel A/legacy.csv", b"older")
 
-    def test_list_scopes_to_panel(self):
-        rows = fr.list_recoveries("Panel A", destination_bucket="rec", s3=self.s3)
-        self.assertEqual(len(rows), 3)  # marker skipped, Panel B excluded
-        self.assertTrue(all(r["recovery_path"].startswith("Panel A/") for r in rows))
-
-    def test_list_user_filter_and_parsing(self):
+    def test_list_is_scoped_to_user_and_panel(self):
         rows = fr.list_recoveries("Panel A", user="u1", destination_bucket="rec", s3=self.s3)
-        self.assertEqual([(r["user"], r["run_id"], r["filename"]) for r in rows],
-                         [("u1", "20261027T100000Z-aaaaaaaa", "f.csv")])
-        legacy = [r for r in fr.list_recoveries("Panel A", destination_bucket="rec", s3=self.s3) if r["filename"] == "legacy.csv"][0]
-        self.assertIsNone(legacy["run_id"])
+        self.assertEqual([r["recovery_path"] for r in rows], ["u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"])
+        rows2 = fr.list_recoveries("Panel A", user="u2", destination_bucket="rec", s3=self.s3)
+        self.assertEqual([r["recovery_path"] for r in rows2], ["u2/Panel A/20261027T110000Z-bbbbbbbb/f.csv"])
+        rowsb = fr.list_recoveries("Panel B", user="u1", destination_bucket="rec", s3=self.s3)
+        self.assertEqual(len(rowsb), 1)
+
+    def test_list_parsing_and_default_user(self):
+        r = fr.list_recoveries("Panel A", user="u1", destination_bucket="rec", s3=self.s3)[0]
+        self.assertEqual((r["user"], r["panel"], r["run_id"], r["filename"]),
+                         ("u1", "Panel A", "20261027T100000Z-aaaaaaaa", "f.csv"))
+        # no user given -> the current user ("tester" from RECOVERY_USER), who has no objects here
+        self.assertEqual(fr.list_recoveries("Panel A", destination_bucket="rec", s3=self.s3), [])
+
+    def test_users_do_not_see_each_others_panels(self):
+        self.s3.seed("rec", "6_Recovery/tester/Mine/20261027T130000Z-eeeeeeee/m.csv", b"m")
+        self.assertEqual(len(fr.list_recoveries("Mine", destination_bucket="rec", s3=self.s3)), 1)
+        self.assertEqual(fr.list_recoveries("Mine", user="u1", destination_bucket="rec", s3=self.s3), [])
+
+    def test_legacy_listing_finds_old_layout_only(self):
+        rows = fr.list_legacy_recoveries("panel a", destination_bucket="rec", s3=self.s3)
+        self.assertEqual(sorted(r["filename"] for r in rows), ["legacy.csv", "old.csv"])
+        old = [r for r in rows if r["filename"] == "old.csv"][0]
+        self.assertEqual((old["user"], old["run_id"]), ("u3", "20261026T090000Z-dddddddd"))
+        self.assertIsNone([r for r in rows if r["filename"] == "legacy.csv"][0]["run_id"])
+        only_u3 = fr.list_legacy_recoveries("Panel A", user="u3", destination_bucket="rec", s3=self.s3)
+        self.assertEqual([r["filename"] for r in only_u3], ["old.csv"])
+        # a legacy object is restorable by its path
+        r = fr.restore_from_recovery(old["recovery_path"], "live", "o.csv", destination_bucket="rec", s3=self.s3)
+        self.assertTrue(r["ok"])
 
     def test_restore_verifies_hash(self):
-        p = "Panel A/u1/20261027T100000Z-aaaaaaaa/f.csv"
+        p = "u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"
         r = fr.restore_from_recovery(p, "live", "panel/f.csv", destination_bucket="rec", s3=self.s3)
         self.assertTrue(r["ok"])
         self.assertTrue(r["sha256_verified"])
@@ -177,7 +199,7 @@ class ListAndRestore(unittest.TestCase):
 
     def test_restore_refuses_overwrite(self):
         self.s3.seed("live", "panel/f.csv", b"current")
-        p = "Panel A/u1/20261027T100000Z-aaaaaaaa/f.csv"
+        p = "u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"
         r = fr.restore_from_recovery(p, "live", "panel/f.csv", destination_bucket="rec", s3=self.s3)
         self.assertFalse(r["ok"])
         self.assertEqual(r["action"], "refused")
@@ -186,7 +208,7 @@ class ListAndRestore(unittest.TestCase):
         self.assertTrue(r2["ok"])
 
     def test_restore_dry_run_and_bad_path(self):
-        p = "Panel A/u1/20261027T100000Z-aaaaaaaa/f.csv"
+        p = "u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"
         r = fr.restore_from_recovery(p, "live", "k.csv", dry_run=True, destination_bucket="rec", s3=self.s3)
         self.assertEqual(r["action"], "would_restore")
         self.assertNotIn(("live", "k.csv"), self.s3.objs)
@@ -201,10 +223,10 @@ class Upload(unittest.TestCase):
         data = b"a,b\n1,2\n"
         r = fr.upload_to_recovery(data, "r.csv", panel_name="Panel X", destination_bucket="rec", s3=s3)
         self.assertTrue(r["ok"], r)
-        self.assertRegex(r["recovery_path"], r"^Panel X/tester/\d{8}T\d{6}Z-[0-9a-f]{8}/r\.csv$")
+        self.assertRegex(r["recovery_path"], r"^tester/Panel X/\d{8}T\d{6}Z-[0-9a-f]{8}/r\.csv$")
         (bucket, key), obj = next(iter(s3.objs.items()))
         self.assertEqual(bucket, "rec")
-        self.assertTrue(key.startswith("6_Recovery/Panel X/tester/"))
+        self.assertTrue(key.startswith("6_Recovery/tester/Panel X/"))
         self.assertEqual(obj["data"], data)
         self.assertEqual(obj["meta"]["sha256"], hashlib.sha256(data).hexdigest())
         self.assertEqual(obj["ct"], "text/csv")
@@ -444,12 +466,12 @@ class PanelSnippet(unittest.TestCase):
 
 
 class CaseInsensitivePanel(unittest.TestCase):
-    EXISTING = "6_Recovery/Daily Checklist Equities/u/20261027T100000Z-aaaaaaaa/f.csv"
+    EXISTING = "6_Recovery/tester/Daily Checklist Equities/20261027T100000Z-aaaaaaaa/f.csv"
 
     def fs(self):
         s3 = FakeS3()
         s3.seed("rec", self.EXISTING, b"old")
-        s3.seed("rec", "6_Recovery/Brokerage Recon/", b"")  # folder marker only
+        s3.seed("rec", "6_Recovery/tester/Brokerage Recon/", b"")  # folder marker only
         return s3
 
     def test_resolve_matches_existing_ignoring_case_and_spaces(self):
@@ -467,7 +489,7 @@ class CaseInsensitivePanel(unittest.TestCase):
 
     def test_ambiguous_existing_folders_raise(self):
         s3 = self.fs()
-        s3.seed("rec", "6_Recovery/daily checklist equities/u/r/f.csv", b"x")
+        s3.seed("rec", "6_Recovery/tester/daily checklist equities/r/f.csv", b"x")
         with self.assertRaises(ValueError):
             fr.resolve_panel_folder("DAILY CHECKLIST EQUITIES", destination_bucket="rec", s3=s3)
         # an exact spelling still works
@@ -479,16 +501,16 @@ class CaseInsensitivePanel(unittest.TestCase):
         r = fr.upload_to_recovery(b"a,b\n", "x.csv", panel_name="daily checklist equities",
                                   destination_bucket="rec", s3=s3)
         self.assertTrue(r["ok"], r)
-        self.assertTrue(r["recovery_path"].startswith("Daily Checklist Equities/"))
+        self.assertTrue(r["recovery_path"].startswith("tester/Daily Checklist Equities/"))
         self.assertEqual(r["panel_folder"], "Daily Checklist Equities")
-        self.assertFalse(any(k.startswith("6_Recovery/daily checklist equities/") for (_, k) in s3.objs))
+        self.assertFalse(any(k.startswith("6_Recovery/tester/daily checklist equities/") for (_, k) in s3.objs))
 
     def test_dry_run_reports_matched_folder_and_writes_nothing(self):
         s3 = self.fs()
         n = len(s3.objs)
         r = fr.upload_to_recovery(b"x", "x.csv", panel_name="BROKERAGE RECON", dry_run=True,
                                   destination_bucket="rec", s3=s3)
-        self.assertTrue(r["recovery_path"].startswith("Brokerage Recon/"))
+        self.assertTrue(r["recovery_path"].startswith("tester/Brokerage Recon/"))
         self.assertEqual(len(s3.objs), n)
 
     def test_list_and_copy_use_matched_folder(self):
@@ -498,7 +520,7 @@ class CaseInsensitivePanel(unittest.TestCase):
         s3.seed("src", "k/y.csv", b"zz")
         c = fr.copy_created_object_to_recovery("src", "k/y.csv", panel_name="daily checklist equities",
                                                destination_bucket="rec", s3=s3)
-        self.assertTrue(c["recovery_path"].startswith("Daily Checklist Equities/"))
+        self.assertTrue(c["recovery_path"].startswith("tester/Daily Checklist Equities/"))
 
     def test_sweep_uses_matched_folder(self):
         import pathlib
@@ -509,7 +531,7 @@ class CaseInsensitivePanel(unittest.TestCase):
             (pathlib.Path(d) / "b.csv").write_bytes(b"2")
             r = fr.sweep(d, "daily checklist equities", apply=True, destination_bucket="rec", s3=s3)
         self.assertEqual(r["uploaded"], 2)
-        self.assertTrue(all(f["recovery_path"].startswith("Daily Checklist Equities/")
+        self.assertTrue(all(f["recovery_path"].startswith("tester/Daily Checklist Equities/")
                             for f in r["files"] if f["action"] == "uploaded"))
 
     def test_selfcheck_probe_uses_matched_folder(self):
@@ -518,7 +540,7 @@ class CaseInsensitivePanel(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         probes = [k for (_, k) in s3.objs if k.endswith("selfcheck_probe.txt")]
         self.assertEqual(len(probes), 1)
-        self.assertTrue(probes[0].startswith("6_Recovery/Daily Checklist Equities/"))
+        self.assertTrue(probes[0].startswith("6_Recovery/tester/Daily Checklist Equities/"))
 
     def test_listing_failure_falls_back_with_warning(self):
         class NoList(FakeS3):
@@ -528,7 +550,7 @@ class CaseInsensitivePanel(unittest.TestCase):
         s3 = NoList()
         r = fr.upload_to_recovery(b"x", "x.csv", panel_name="My Panel", destination_bucket="rec", s3=s3)
         self.assertTrue(r["ok"])
-        self.assertTrue(r["recovery_path"].startswith("My Panel/"))
+        self.assertTrue(r["recovery_path"].startswith("tester/My Panel/"))
         self.assertIn("warning", r)
 
     def test_bad_names_still_rejected(self):

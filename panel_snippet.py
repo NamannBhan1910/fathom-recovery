@@ -1,7 +1,7 @@
 """Paste-in block for a panel's generation code (fathom_recovery >= 1.2.0).
 
 Set PANEL_NAME to the exact name the user gave (case and spaces matter).
-Files land in:  6_Recovery/<PANEL_NAME>/<user>/<timestamp>-<8 hex>/<filename>
+Files land in:  6_Recovery/<user>/<PANEL_NAME>/<timestamp>-<8 hex>/<filename>
 
 Two ways to use it (neither runs by itself; the panel's code must call one):
   push(data, filename)  - upload ONE file right when it is created

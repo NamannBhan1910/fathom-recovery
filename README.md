@@ -7,13 +7,13 @@ to be copied into (or pulled into) each one without any panel-specific code.
 ## Where files go
 
 ```
-s3://mosaic-derivatives-margining/6_Recovery/<Panel Name>/<user>/<YYYYMMDDTHHMMSSZ>-<8 hex>/<filename>
+s3://mosaic-derivatives-margining/6_Recovery/<user>/<Panel Name>/<YYYYMMDDTHHMMSSZ>-<8 hex>/<filename>
 ```
 
 | Part | Source |
 |---|---|
-| `<Panel Name>` | **Required.** Given by the user at execution. Matched to an existing folder ignoring case and extra spaces (`daily checklist equities` uses `Daily Checklist Equities`). A name that matches no folder creates one, with the spelling given. If two existing folders differ only by case, the call fails and the exact spelling must be used. |
-| `<user>` | `--user` / `user=` > `RECOVERY_USER` env > `bridge.whoami()` > `unknown-user` |
+| `<Panel Name>` | **Required.** Lives inside the user's own folder. Given by the user at execution. Matched to an existing folder ignoring case and extra spaces (`daily checklist equities` uses `Daily Checklist Equities`). A name that matches no folder creates one, with the spelling given. If two existing folders differ only by case, the call fails and the exact spelling must be used. |
+| `<user>` | First level. `--user` / `user=` > `RECOVERY_USER` env > `bridge.whoami()` > `unknown-user`. Every user gets their own folder, and panel names are matched only inside it. |
 | `<timestamp>-<8 hex>` | UTC time of the copy + random suffix. Unique per copy, so **nothing is overwritten**; every version is kept. |
 
 Each recovery object carries `sha256` metadata of the source bytes. The helper checks the copied size
@@ -21,6 +21,17 @@ against the source and reports `ok: false` on mismatch. Panel names are sanitise
 create extra folders; blank, `.` and `..` are rejected) **before** any write.
 
 Bucket/prefix defaults can be overridden with `RECOVERY_DESTINATION_BUCKET` / `RECOVERY_DESTINATION_PREFIX`.
+
+## Layout change in v1.6.0: user first, then panel
+
+Before v1.6.0 files went to `6_Recovery/<Panel>/<user>/...`. From v1.6.0 they go to
+`6_Recovery/<user>/<Panel>/...`, so each user has one folder holding all of their panels.
+
+- Panel names are matched (case and extra spaces ignored) only inside the current user's folder, so two
+  users can have panels with the same name without sharing a folder.
+- `list` shows the current user's panel by default; `--user <name>` looks at another user's.
+- Nothing already in S3 was moved or renamed. Objects written before v1.6.0 stay under the old path and
+  can be found with `list --legacy` and restored with their `recovery_path` as before.
 
 ## Repo layout
 
@@ -47,7 +58,7 @@ from fathom_recovery import upload_to_recovery
 upload_to_recovery(csv_bytes, "report.csv", panel_name=PANEL_NAME)   # bytes / str content
 upload_to_recovery(Path("report.csv"), panel_name=PANEL_NAME)        # local file
 ```
-   It writes `6_Recovery/<PANEL_NAME>/<user>/<timestamp>-<8 hex>/<file>` with `sha256` metadata and
+   It writes `6_Recovery/<user>/<PANEL_NAME>/<timestamp>-<8 hex>/<file>` with `sha256` metadata and
    verifies size, stored sha256 and the content read back; `result["ok"]` is the pass/fail.
    A plain `str` is treated as **content**; pass a `Path` for a file.
 
@@ -61,14 +72,14 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
-### Fastest setup for a new panel (v1.5.1+)
+### Fastest setup for a new panel (v1.6.0+)
 
 Run these in the panel's workspace root (in Fathom, ask the panel's agent to run them). The clone goes
 into a folder named after the version, so running the lines again never fails with "already exists":
 
 ```
-[ -d fathom-recovery-v1.5.1 ] || git clone --depth 1 --branch v1.5.1 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.5.1
-python3 fathom-recovery-v1.5.1/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.6.0 ] || git clone --depth 1 --branch v1.6.0 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.6.0
+python3 fathom-recovery-v1.6.0/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone, writes `recovery_config.json` and
@@ -108,7 +119,7 @@ files and never touches S3.
 
 ```
 python3 fathom_recovery.py list    --panel-name "My Panel" [--user someone] [--limit 20]
-python3 fathom_recovery.py restore --recovery-path "My Panel/<user>/<run>/<file>" \
+python3 fathom_recovery.py restore --recovery-path "<user>/My Panel/<run>/<file>" \
                                    --target-bucket B --target-key K            # dry run
                                    # add --apply to restore, --overwrite to replace an existing target
 ```
@@ -157,7 +168,7 @@ Spelling matters except for case and extra spaces. Add a row before a panel star
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.5.1 --dest scripts --run-tests --panel-name "<Panel>"
+python3 sync_recovery.py --repo <git url> --ref v1.6.0 --dest scripts --run-tests --panel-name "<Panel>"
 ```
 (`sync_recovery.py` itself can be run again and again; only a plain `git clone` into an existing folder
 fails, so clone into a new or versioned folder name.)
