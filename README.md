@@ -12,7 +12,7 @@ s3://mosaic-derivatives-margining/6_Recovery/<Panel Name>/<user>/<YYYYMMDDTHHMMS
 
 | Part | Source |
 |---|---|
-| `<Panel Name>` | **Required.** Given by the user at execution. Exact match: case and spaces matter. A new name creates a new panel folder. |
+| `<Panel Name>` | **Required.** Given by the user at execution. Matched to an existing folder ignoring case and extra spaces (`daily checklist equities` uses `Daily Checklist Equities`). A name that matches no folder creates one, with the spelling given. If two existing folders differ only by case, the call fails and the exact spelling must be used. |
 | `<user>` | `--user` / `user=` > `RECOVERY_USER` env > `bridge.whoami()` > `unknown-user` |
 | `<timestamp>-<8 hex>` | UTC time of the copy + random suffix. Unique per copy, so **nothing is overwritten**; every version is kept. |
 
@@ -82,7 +82,7 @@ Offline only; nothing touches S3.
 ## Rules of thumb
 
 - A panel is only protected once its generation code calls the helper.
-- Use the **same** panel name every time for the same panel (exact match, so a typo makes a new folder).
+- Case and extra spaces in the panel name don't matter (v1.4.0+), but a typo still creates a new folder.
 - The helper never deletes anything. Retention/cleanup, if wanted, should be an S3 lifecycle rule on `6_Recovery/`.
 - Needs AWS credentials with `s3:GetObject` and `s3:PutObject` on the source and recovery locations, and `s3:ListBucket` for `list`.
   For `upload` only the recovery prefix is needed: `s3:PutObject`, `s3:GetObject` (read-back check) and `s3:ListBucket`
@@ -92,7 +92,7 @@ Offline only; nothing touches S3.
 
 ## Registered panel names
 
-Exact spelling matters. Add a row before a panel starts uploading.
+Spelling matters except for case and extra spaces. Add a row before a panel starts uploading.
 
 | Panel name | Notes |
 |---|---|

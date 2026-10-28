@@ -49,11 +49,19 @@ class FakeS3:
         fs = self
 
         class P:
-            def paginate(self, Bucket, Prefix):
-                items = [{"Key": k, "Size": len(o["data"]), "LastModified": o["lm"]}
-                         for (b, k), o in fs.objs.items() if b == Bucket and k.startswith(Prefix)]
-                yield {"Contents": items}
+            def paginate(self, Bucket, Prefix, Delimiter=None):
+                keys = [(k, o) for (b, k), o in fs.objs.items() if b == Bucket and k.startswith(Prefix)]
+                if Delimiter:
+                    cps = sorted({Prefix + k[len(Prefix):].split(Delimiter)[0] + Delimiter
+                                  for k, _ in keys if Delimiter in k[len(Prefix):]})
+                    direct = [{"Key": k, "Size": len(o["data"]), "LastModified": o["lm"]}
+                              for k, o in keys if Delimiter not in k[len(Prefix):]]
+                    yield {"Contents": direct, "CommonPrefixes": [{"Prefix": c} for c in cps]}
+                else:
+                    yield {"Contents": [{"Key": k, "Size": len(o["data"]), "LastModified": o["lm"]}
+                                        for k, o in keys]}
         return P()
+
 
 
 class KeyLayout(unittest.TestCase):
@@ -435,7 +443,99 @@ class PanelSnippet(unittest.TestCase):
         self.assertIn(".txt", ",".join(fr.SWEEP_DEFAULT_PATTERNS))
 
 
+class CaseInsensitivePanel(unittest.TestCase):
+    EXISTING = "6_Recovery/Daily Checklist Equities/u/20261027T100000Z-aaaaaaaa/f.csv"
 
+    def fs(self):
+        s3 = FakeS3()
+        s3.seed("rec", self.EXISTING, b"old")
+        s3.seed("rec", "6_Recovery/Brokerage Recon/", b"")  # folder marker only
+        return s3
+
+    def test_resolve_matches_existing_ignoring_case_and_spaces(self):
+        s3 = self.fs()
+        for given in ("daily checklist equities", "DAILY CHECKLIST EQUITIES", "  Daily   Checklist  Equities "):
+            self.assertEqual(fr.resolve_panel_folder(given, destination_bucket="rec", s3=s3),
+                             "Daily Checklist Equities", given)
+        self.assertEqual(fr.resolve_panel_folder("brokerage recon", destination_bucket="rec", s3=s3), "Brokerage Recon")
+
+    def test_exact_name_and_new_name(self):
+        s3 = self.fs()
+        self.assertEqual(fr.resolve_panel_folder("Daily Checklist Equities", destination_bucket="rec", s3=s3),
+                         "Daily Checklist Equities")
+        self.assertEqual(fr.resolve_panel_folder("Brand New Panel", destination_bucket="rec", s3=s3), "Brand New Panel")
+
+    def test_ambiguous_existing_folders_raise(self):
+        s3 = self.fs()
+        s3.seed("rec", "6_Recovery/daily checklist equities/u/r/f.csv", b"x")
+        with self.assertRaises(ValueError):
+            fr.resolve_panel_folder("DAILY CHECKLIST EQUITIES", destination_bucket="rec", s3=s3)
+        # an exact spelling still works
+        self.assertEqual(fr.resolve_panel_folder("daily checklist equities", destination_bucket="rec", s3=s3),
+                         "daily checklist equities")
+
+    def test_upload_uses_existing_folder_spelling(self):
+        s3 = self.fs()
+        r = fr.upload_to_recovery(b"a,b\n", "x.csv", panel_name="daily checklist equities",
+                                  destination_bucket="rec", s3=s3)
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["recovery_path"].startswith("Daily Checklist Equities/"))
+        self.assertEqual(r["panel_folder"], "Daily Checklist Equities")
+        self.assertFalse(any(k.startswith("6_Recovery/daily checklist equities/") for (_, k) in s3.objs))
+
+    def test_dry_run_reports_matched_folder_and_writes_nothing(self):
+        s3 = self.fs()
+        n = len(s3.objs)
+        r = fr.upload_to_recovery(b"x", "x.csv", panel_name="BROKERAGE RECON", dry_run=True,
+                                  destination_bucket="rec", s3=s3)
+        self.assertTrue(r["recovery_path"].startswith("Brokerage Recon/"))
+        self.assertEqual(len(s3.objs), n)
+
+    def test_list_and_copy_use_matched_folder(self):
+        s3 = self.fs()
+        rows = fr.list_recoveries("DAILY checklist EQUITIES", destination_bucket="rec", s3=s3)
+        self.assertEqual([r["filename"] for r in rows], ["f.csv"])
+        s3.seed("src", "k/y.csv", b"zz")
+        c = fr.copy_created_object_to_recovery("src", "k/y.csv", panel_name="daily checklist equities",
+                                               destination_bucket="rec", s3=s3)
+        self.assertTrue(c["recovery_path"].startswith("Daily Checklist Equities/"))
+
+    def test_sweep_uses_matched_folder(self):
+        import pathlib
+        import tempfile
+        s3 = self.fs()
+        with tempfile.TemporaryDirectory() as d:
+            (pathlib.Path(d) / "a.csv").write_bytes(b"1")
+            (pathlib.Path(d) / "b.csv").write_bytes(b"2")
+            r = fr.sweep(d, "daily checklist equities", apply=True, destination_bucket="rec", s3=s3)
+        self.assertEqual(r["uploaded"], 2)
+        self.assertTrue(all(f["recovery_path"].startswith("Daily Checklist Equities/")
+                            for f in r["files"] if f["action"] == "uploaded"))
+
+    def test_selfcheck_probe_uses_matched_folder(self):
+        s3 = self.fs()
+        r = fr.selfcheck("daily checklist equities", apply=True, destination_bucket="rec", s3=s3)
+        self.assertTrue(r["ok"], r)
+        probes = [k for (_, k) in s3.objs if k.endswith("selfcheck_probe.txt")]
+        self.assertEqual(len(probes), 1)
+        self.assertTrue(probes[0].startswith("6_Recovery/Daily Checklist Equities/"))
+
+    def test_listing_failure_falls_back_with_warning(self):
+        class NoList(FakeS3):
+            def get_paginator(self, name):
+                raise ClientError({"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+                                  "ListObjectsV2")
+        s3 = NoList()
+        r = fr.upload_to_recovery(b"x", "x.csv", panel_name="My Panel", destination_bucket="rec", s3=s3)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["recovery_path"].startswith("My Panel/"))
+        self.assertIn("warning", r)
+
+    def test_bad_names_still_rejected(self):
+        s3 = self.fs()
+        for bad in ("", "..", "<name>"):
+            with self.assertRaises(ValueError, msg=bad):
+                fr.resolve_panel_folder(bad, destination_bucket="rec", s3=s3)
 
 
 

@@ -61,7 +61,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 DESTINATION_BUCKET = os.environ.get("RECOVERY_DESTINATION_BUCKET", "mosaic-derivatives-margining")
 DESTINATION_PREFIX = os.environ.get("RECOVERY_DESTINATION_PREFIX", "6_Recovery/")
@@ -176,6 +176,59 @@ def _require_panel(panel_name: Any) -> str:
     return _safe_segment(panel_name, "panel_name")
 
 
+def resolve_panel_folder(
+    panel_name: str,
+    *,
+    destination_bucket: str = DESTINATION_BUCKET,
+    destination_prefix: str = DESTINATION_PREFIX,
+    s3: Any | None = None,
+) -> str:
+    """Return the panel folder name to use, ignoring case and extra spaces (read-only).
+
+    S3 keys are case-sensitive, so 'daily checklist equities' would otherwise create a second
+    folder. This lists the folders under the recovery prefix:
+      * exact spelling exists            -> use it
+      * exactly one case-insensitive hit -> use that folder's spelling
+      * several case-insensitive hits    -> ValueError (ambiguous; use the exact spelling)
+      * no hit                           -> the name as given (the folder is created on first upload)
+    """
+    panel = _require_panel(panel_name)
+    client = s3 or boto3.client("s3")
+    root = _clean_prefix(destination_prefix)
+    names: list[str] = []
+    for page in client.get_paginator("list_objects_v2").paginate(
+        Bucket=destination_bucket, Prefix=root, Delimiter="/"
+    ):
+        for cp in page.get("CommonPrefixes", []):
+            names.append(cp["Prefix"][len(root):].rstrip("/"))
+    if panel in names:
+        return panel
+    want = panel.casefold()
+    matches = sorted({n for n in names if " ".join(n.split()).casefold() == want})
+    if len(matches) > 1:
+        raise ValueError(
+            f"panel name {panel!r} matches several existing folders {matches}; use the exact spelling"
+        )
+    return matches[0] if matches else panel
+
+
+def _panel_folder(
+    panel_name: str, client: Any | None, bucket: str, prefix: str
+) -> tuple[str, str | None]:
+    """resolve_panel_folder, but a listing failure falls back to the name as given plus a warning.
+
+    A backup should not be blocked just because listing is not permitted; the warning says the
+    folder was not matched against existing spellings. Ambiguity (ValueError) still raises.
+    """
+    panel = _require_panel(panel_name)
+    if client is None:
+        return panel, "panel folder not matched against existing folders (no S3 client)"
+    try:
+        return resolve_panel_folder(panel, destination_bucket=bucket, destination_prefix=prefix, s3=client), None
+    except (ClientError, BotoCoreError) as exc:
+        return panel, f"panel folder not matched against existing folders ({type(exc).__name__})"
+
+
 # ----------------------------------------------------------------- backup
 def copy_created_object_to_recovery(
     source_bucket: str,
@@ -199,7 +252,8 @@ def copy_created_object_to_recovery(
 
     client = s3 or boto3.client("s3")
     filename = posixpath.basename(source_key)
-    dest_key = build_destination_key(source_key, panel_name, user, destination_prefix)
+    panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix)
+    dest_key = build_destination_key(source_key, panel_folder, user, destination_prefix)
     relative_dest = dest_key[len(_clean_prefix(destination_prefix)):]
 
     source_meta = _head_object(client, source_bucket, source_key)
@@ -213,6 +267,8 @@ def copy_created_object_to_recovery(
             "source_verified": True,
             "source_size_bytes": source_meta["size_bytes"],
             "dry_run": True,
+            "panel_folder": panel_folder,
+            **({"warning": panel_warning} if panel_warning else {}),
         }
 
     sha256 = _sha256_of_object(client, source_bucket, source_key)
@@ -238,6 +294,8 @@ def copy_created_object_to_recovery(
         "destination_size_bytes": dest_meta["size_bytes"],
         "sha256": sha256,
         "dry_run": False,
+        "panel_folder": panel_folder,
+        **({"warning": panel_warning} if panel_warning else {}),
     }
 
 
@@ -301,8 +359,12 @@ def upload_to_recovery(
     destination_bucket: str = DESTINATION_BUCKET,
     destination_prefix: str = DESTINATION_PREFIX,
     s3: Any | None = None,
+    match_existing_folder: bool = True,
 ) -> dict[str, Any]:
     """Store data directly in the panel's recovery folder (no source object needed).
+
+    The panel name is matched to an existing folder ignoring case and extra spaces (see
+    resolve_panel_folder). match_existing_folder=False skips that lookup (sweep resolves once).
 
     data      bytes, str (utf-8) or a path to a local file (os.PathLike).
               NOTE: a plain str is treated as CONTENT; pass pathlib.Path for a file.
@@ -329,14 +391,20 @@ def upload_to_recovery(
     if not destination_bucket:
         raise ValueError("destination_bucket is required")
 
-    key = build_destination_key(name, panel_name, user, destination_prefix)
+    panel_folder, panel_warning = _require_panel(panel_name), None
+    client = s3
+    if match_existing_folder and (not dry_run or s3 is not None):
+        client = s3 or boto3.client("s3")
+        panel_folder, panel_warning = _panel_folder(panel_name, client, destination_bucket, destination_prefix)
+    key = build_destination_key(name, panel_folder, user, destination_prefix)
     rel = key[len(_clean_prefix(destination_prefix)):]
     sha = hashlib.sha256(body).hexdigest()
-    base = {"filename": name, "recovery_path": rel, "size_bytes": len(body), "sha256": sha}
+    base = {"filename": name, "recovery_path": rel, "size_bytes": len(body), "sha256": sha,
+            "panel_folder": panel_folder, **({"warning": panel_warning} if panel_warning else {})}
     if dry_run:
         return {**base, "ok": True, "action": "would_upload", "dry_run": True}
 
-    client = s3 or boto3.client("s3")
+    client = client or boto3.client("s3")
     client.put_object(
         Bucket=destination_bucket, Key=key, Body=body,
         ContentType=content_type or mimetypes.guess_type(name)[0] or "application/octet-stream",
@@ -371,9 +439,11 @@ def list_recoveries(
     Understands the standard layout (panel/user/run/file) and older layouts
     (panel/file, panel/user/file) - for those, user / run_id may be None.
     """
-    panel = _require_panel(panel_name)
+    _require_panel(panel_name)
     client = s3 or boto3.client("s3")
     root = _clean_prefix(destination_prefix)
+    panel = resolve_panel_folder(panel_name, destination_bucket=destination_bucket,
+                                 destination_prefix=destination_prefix, s3=client)
     prefix = f"{root}{panel}/" + (f"{_safe_segment(user, 'user')}/" if user else "")
     out: list[dict[str, Any]] = []
     for page in client.get_paginator("list_objects_v2").paginate(Bucket=destination_bucket, Prefix=prefix):
@@ -491,14 +561,17 @@ def selfcheck(
 
     def s_name():
         state["key"] = build_destination_key("selfcheck_probe.txt", panel_name, user, destination_prefix)
-        return "layout: " + state["key"][len(_clean_prefix(destination_prefix)):]
+        return "panel name is valid (folder is matched to existing spellings in the next step)"
 
     def s_list():
         nonlocal client
         client = client or boto3.client("s3")
+        folder = resolve_panel_folder(panel_name, destination_bucket=destination_bucket,
+                                      destination_prefix=destination_prefix, s3=client)
+        state["key"] = build_destination_key("selfcheck_probe.txt", folder, user, destination_prefix)
         state["before"] = len(list_recoveries(panel_name, destination_bucket=destination_bucket,
                                               destination_prefix=destination_prefix, s3=client))
-        return f"list ok, {state['before']} existing object(s)"
+        return f"list ok, folder {folder!r}, {state['before']} existing object(s)"
 
     def s_write():
         data = f"fathom_recovery selfcheck {datetime.now(timezone.utc).isoformat()}\n".encode()
@@ -578,6 +651,8 @@ def sweep(
 
     found = sorted(root.rglob("*") if recursive else root.glob("*"))
     client = s3
+    panel_folder = panel_name  # resolved once (case-insensitive) on the first real upload
+    resolved = False
     files: list[dict[str, Any]] = []
     counts = {"scanned": 0, "uploaded": 0, "would_upload": 0, "unchanged": 0, "failed": 0}
     for p in found:
@@ -607,9 +682,13 @@ def sweep(
             continue
         try:
             client = client or boto3.client("s3")
+            if not resolved:
+                panel_folder, _ = _panel_folder(panel_name, client, destination_bucket, destination_prefix)
+                resolved = True
             res = upload_to_recovery(
-                data, p.name, panel_name=panel_name, user=user, s3=client,
+                data, p.name, panel_name=panel_folder, user=user, s3=client,
                 destination_bucket=destination_bucket, destination_prefix=destination_prefix,
+                match_existing_folder=False,
             )
         except Exception as exc:  # noqa: BLE001 - one bad file must not stop the sweep
             counts["failed"] += 1
