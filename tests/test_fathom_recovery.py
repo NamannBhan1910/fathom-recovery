@@ -855,6 +855,77 @@ class SetupPanel(unittest.TestCase):
         self.assertTrue((self.d / "panel_snippet.py").is_file())
 
 
+class SetupCommandAndScopedInit(unittest.TestCase):
+    """v1.7.0 fix: the CLI offers `setup` (as the prompt says) and `init` stays inside the recovery scope."""
+
+    def setUp(self):
+        import pathlib
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.d = pathlib.Path(self._td.name)
+
+    def _cli(self, *args):
+        import subprocess
+        root = __import__("pathlib").Path(__file__).resolve().parent.parent
+        env = dict(os.environ, RECOVERY_USER="tester")
+        return subprocess.run([sys.executable, str(root / "fathom_recovery.py"), *args], cwd=self.d,
+                              capture_output=True, text=True, env=env)
+
+    def test_cli_init_does_not_write_instructions_by_default(self):
+        r = self._cli("init", "--panel-name", "P")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.d / "recovery_config.json").is_file())
+        self.assertFalse((self.d / "RECOVERY_INSTRUCTIONS.md").exists())
+
+    def test_cli_init_with_instructions_flag_writes_it(self):
+        r = self._cli("init", "--panel-name", "P", "--with-instructions")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.d / "RECOVERY_INSTRUCTIONS.md").is_file())
+
+    def test_setup_is_a_valid_subcommand(self):
+        r = self._cli("setup", "-h")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--panel-name", r.stdout)
+        self.assertIn("--apply", r.stdout)
+
+    def test_setup_rejects_placeholder_name_and_writes_nothing(self):
+        for bad in ("<Panel Name>", "..", ""):
+            r = self._cli("setup", "--panel-name", bad)
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("[FAIL] 1 panel name", r.stdout)
+        self.assertEqual(list(self.d.iterdir()), [])
+
+    def test_setup_panel_function_dry_run_and_apply_stay_in_scope(self):
+        import json
+        s3 = FakeS3()
+        (self.d / "main.py").write_text("print(1)")
+        (self.d / "outputs").mkdir()
+        (self.d / "outputs" / "a.csv").write_text("x\n1\n")
+        kw = dict(directory=self.d, user="tester", s3=s3)
+        r = fr.setup_panel("My Panel", "outputs", **kw)  # dry run
+        self.assertTrue(r["ok"], r["lines"])
+        self.assertEqual(r["layout"], "user/panel")
+        self.assertEqual(r["code_backup"], "1")
+        self.assertEqual([s["status"] for s in r["steps"]], ["PASS"] * 7)
+        self.assertEqual(s3.objs, {})  # dry run writes nothing to S3
+        self.assertFalse((self.d / ".fathom_recovery").exists())
+        self.assertFalse((self.d / "RECOVERY_INSTRUCTIONS.md").exists())
+        before = {p.name for p in self.d.iterdir()}
+        r = fr.setup_panel("My Panel", "outputs", apply=True, **kw)
+        self.assertTrue(r["ok"], r["lines"])
+        self.assertTrue((self.d / ".fathom_recovery" / "state.json").is_file())
+        self.assertTrue((self.d / ".fathom_recovery" / "code_state.json").is_file())
+        after = {p.name for p in self.d.iterdir()}
+        self.assertEqual(after - before, {".fathom_recovery"})  # nothing else created locally
+        self.assertFalse((self.d / "RECOVERY_INSTRUCTIONS.md").exists())
+        # existing config is kept, not overwritten
+        (self.d / "recovery_config.json").write_text(json.dumps({"panel_name": "Edited", "output_dir": "outputs"}))
+        r = fr.setup_panel("Other", "outputs", **kw)
+        self.assertIn("kept as is", r["lines"][1])
+        self.assertIn("Edited", (self.d / "recovery_config.json").read_text())
+
+
 class InstructionsText(unittest.TestCase):
     def test_instructions_include_setup_and_versioned_clone(self):
         ins = fr.render_instructions("My Panel", "outputs")
@@ -1284,7 +1355,7 @@ class CodeCli(unittest.TestCase):
         self.assertIn("sweep --config recovery_config.json --apply", ins)  # data rule is still there
 
     def test_markers(self):
-        self.assertEqual(fr.__version__, "1.7.0")
+        self.assertEqual(fr.__version__, "1.7.1")
         self.assertEqual(fr.LAYOUT, "user/panel")
         self.assertEqual(fr.CODE_BACKUP, "1")
 

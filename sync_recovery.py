@@ -80,10 +80,13 @@ def init_panel_files(installed: str, panel_name: str, output_dir: str, force: bo
 
     Both files go in the current folder (the panel's workspace root). Local files only; no S3.
     """
-    cmd = [sys.executable, installed, "init", "--panel-name", panel_name, "--output-dir", output_dir]
+    base = [sys.executable, installed, "init", "--panel-name", panel_name, "--output-dir", output_dir]
     if force:
-        cmd.append("--force")
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        base.append("--force")
+    # v1.7.1+ writes the instructions file only on request; older tags always wrote it and lack the flag
+    r = subprocess.run(base + ["--with-instructions"], capture_output=True, text=True, timeout=60)
+    if r.returncode == 2 and "unrecognized arguments" in r.stderr:
+        r = subprocess.run(base, capture_output=True, text=True, timeout=60)
     try:
         out = json.loads(r.stdout)
     except ValueError:

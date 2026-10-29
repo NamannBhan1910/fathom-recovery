@@ -79,7 +79,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 LAYOUT = "user/panel"  # marker: <prefix>/<user>/<panel>/<run>/<file>. Panels grep for this line.
 CODE_BACKUP = "1"  # marker: this script has code-sweep / restore-code. Panels grep for this line.
 REPO_URL = "https://github.com/NamannBhan1910/fathom-recovery.git"
@@ -1215,10 +1215,13 @@ def init_panel(
     directory: str | os.PathLike = ".",
     patterns: list[str] | None = None,
     force: bool = False,
+    write_instructions: bool = True,
 ) -> dict[str, Any]:
-    """Write recovery_config.json and RECOVERY_INSTRUCTIONS.md into `directory` (local files only, no S3).
+    """Write recovery_config.json (and, if write_instructions, RECOVERY_INSTRUCTIONS.md) into `directory`.
 
-    Refuses to overwrite an existing config unless force=True.
+    Local files only, no S3. Refuses to overwrite an existing config unless force=True.
+    The CLI `init` passes write_instructions=False unless --with-instructions is given, because the
+    instructions file is not one of the files a recovery job is allowed to create in a panel.
     """
     panel = " ".join(_require_panel(panel_name).split())
     d = Path(directory)
@@ -1230,12 +1233,122 @@ def init_panel(
     if patterns:
         cfg["patterns"] = list(patterns)
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-    ins_path.write_text(render_instructions(panel, output_dir, CONFIG_NAME), encoding="utf-8")
-    return {
+    result: dict[str, Any] = {
         "ok": True, "action": "init", "panel_name": panel, "output_dir": output_dir,
-        "config_file": str(cfg_path), "instructions_file": str(ins_path),
-        "next": f"give the contents of {INSTRUCTIONS_NAME} to this panel's agent as a standing instruction",
+        "config_file": str(cfg_path), "instructions_file": None,
     }
+    if write_instructions:
+        ins_path.write_text(render_instructions(panel, output_dir, CONFIG_NAME), encoding="utf-8")
+        result["instructions_file"] = str(ins_path)
+        result["next"] = f"give the contents of {INSTRUCTIONS_NAME} to this panel's agent as a standing instruction"
+    return result
+
+
+def setup_panel(
+    panel_name: str,
+    output_dir: str = "outputs",
+    *,
+    directory: str | os.PathLike = ".",
+    user: str | None = None,
+    apply: bool = False,
+    destination_bucket: str = DESTINATION_BUCKET,
+    destination_prefix: str = DESTINATION_PREFIX,
+    s3: Any | None = None,
+) -> dict[str, Any]:
+    """One-command setup check for a panel, matching the v1.7.0 prompt. Dry run unless apply=True.
+
+    Local writes are limited to the recovery scope: recovery_config.json (only if it does not exist yet),
+    the output folder (only if missing) and, with apply, .fathom_recovery/state.json + code_state.json.
+    It never writes RECOVERY_INSTRUCTIONS.md and never deletes anything.
+    Steps: panel name -> config -> output folder -> resolve user/panel folders (read-only listing)
+    -> selfcheck -> data sweep -> code sweep. Every step is PASS / FAIL / SKIP.
+    """
+    steps: list[dict[str, str]] = []
+
+    def rec(name: str, status: str, detail: str) -> bool:
+        steps.append({"step": name, "status": status, "detail": detail})
+        return status != "FAIL"
+
+    d = Path(directory).resolve()
+    result: dict[str, Any] = {"ok": False, "action": "setup", "applied": apply,
+                              "layout": LAYOUT, "code_backup": CODE_BACKUP, "version": __version__,
+                              "steps": steps}
+
+    def finish() -> dict[str, Any]:
+        result["ok"] = not any(s["status"] == "FAIL" for s in steps)
+        result["lines"] = [f"[{s['status']}] {s['step']}: {s['detail']}" for s in steps]
+        return result
+
+    try:
+        panel = " ".join(_require_panel(panel_name).split())
+        rec("1 panel name", "PASS", repr(panel))
+    except ValueError as exc:
+        rec("1 panel name", "FAIL", str(exc))
+        return finish()
+
+    cfg_path = d / CONFIG_NAME
+    try:
+        if cfg_path.exists():
+            rec("2 config", "PASS", f"{CONFIG_NAME} already exists - kept as is")
+        else:
+            init_panel(panel, output_dir, directory=d, write_instructions=False)
+            rec("2 config", "PASS", f"wrote {CONFIG_NAME}")
+        cfg = load_config(cfg_path)
+    except ValueError as exc:
+        rec("2 config", "FAIL", str(exc))
+        return finish()
+
+    panel = cfg["panel_name"]
+    out_dir = Path(cfg["output_dir_resolved"])
+    existed = out_dir.is_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rec("3 output folder", "PASS", f"{cfg['output_dir']} ({'exists' if existed else 'created, empty for now'}); "
+        "make sure your panel really writes its data files there")
+
+    client = s3
+    kw = {"destination_bucket": destination_bucket, "destination_prefix": destination_prefix}
+    try:
+        client = client or boto3.client("s3")
+        who = resolve_user_folder(user, s3=client, **kw)
+        folder = resolve_panel_folder(panel, user=who, s3=client, **kw)
+        result["user_folder"], result["panel_folder"] = who, folder
+        rec("4 folders", "PASS", f"user folder {who!r}, panel folder {folder!r}")
+    except Exception as exc:  # noqa: BLE001 - report, do not crash
+        rec("4 folders", "FAIL", f"{type(exc).__name__}: {exc}")
+        return finish()
+
+    sc = selfcheck(panel, user=who, apply=apply, s3=client, **kw)
+    detail = "; ".join(f"{s['step']}={'ok' if s['ok'] else 'FAILED: ' + str(s['detail'])[:160]}" for s in sc["steps"])
+    rec("5 selfcheck" + (" --apply" if apply else " (dry run)"), "PASS" if sc["ok"] else "FAIL", detail)
+
+    state_dir = d / CODE_STATE_DIR
+    if apply:
+        state_dir.mkdir(exist_ok=True)
+
+    def summarize(r: dict[str, Any], extra: tuple[str, ...] = ()) -> str:
+        keys = ("scanned", "uploaded", "would_upload", "unchanged", "failed") + extra
+        text = " ".join(f"{k}={r.get(k)}" for k in keys)
+        errs = [f.get("error", "") for f in r.get("files", []) if f.get("action") == "failed"]
+        return text + (" | " + errs[0][:160] if errs else "")
+
+    try:
+        sw = sweep(out_dir, panel, patterns=cfg.get("patterns") or SWEEP_DEFAULT_PATTERNS,
+                   state_path=state_dir / "state.json", user=who, apply=apply, s3=client, **kw)
+        rec("6 sweep" + (" --apply" if apply else " (dry run)"), "PASS" if sw["ok"] else "FAIL", summarize(sw))
+    except Exception as exc:  # noqa: BLE001
+        rec("6 sweep", "FAIL", f"{type(exc).__name__}: {exc}")
+    try:
+        cs = code_sweep(d, panel, patterns=cfg.get("code_patterns"),
+                        exclude_dirs=cfg.get("code_exclude_dirs") or (), data_dir=out_dir,
+                        data_patterns=cfg.get("patterns") or SWEEP_DEFAULT_PATTERNS,
+                        state_path=state_dir / CODE_STATE_NAME, user=who, apply=apply, s3=client, **kw)
+        rec("7 code-sweep" + (" --apply" if apply else " (dry run)"), "PASS" if cs["ok"] else "FAIL",
+            summarize(cs, ("skipped_sensitive", "skipped_large")))
+    except Exception as exc:  # noqa: BLE001
+        rec("7 code-sweep", "FAIL", f"{type(exc).__name__}: {exc}")
+    if not apply:
+        result["note"] = "dry run: nothing was written to S3; add --apply to check write access and upload"
+    return finish()
 
 
 # --------------------------------------------------------------------- CLI
@@ -1327,7 +1440,19 @@ def build_parser() -> argparse.ArgumentParser:
     rc_.add_argument("--apply", action="store_true", help="actually write files (default is dry run)")
     common(rc_)
 
-    ini = sub.add_parser("init", help="write recovery_config.json + RECOVERY_INSTRUCTIONS.md (local files only)")
+    st = sub.add_parser("setup", help="one-command setup check: config, output folder, selfcheck, sweep, "
+                                      "code-sweep (dry run unless --apply)")
+    st.add_argument("--panel-name", required=True)
+    st.add_argument("--output-dir", default="outputs", help="folder this panel writes data files to")
+    st.add_argument("--directory", default=".", help="panel workspace root (default: current folder)")
+    st.add_argument("--user", default=None)
+    st.add_argument("--apply", action="store_true", help="write to S3 (selfcheck probe + uploads); default is dry run")
+    common(st)
+
+    ini = sub.add_parser("init", help="write recovery_config.json (local file only; instructions file only with "
+                                      "--with-instructions)")
+    ini.add_argument("--with-instructions", action="store_true",
+                     help="also write RECOVERY_INSTRUCTIONS.md (off by default: it is not a recovery-scope file)")
     ini.add_argument("--panel-name", required=True)
     ini.add_argument("--output-dir", default="outputs", help="folder this panel writes data files to")
     ini.add_argument("--directory", default=".", help="where to write the two files (default: current folder)")
@@ -1419,7 +1544,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif args.cmd == "init":
             result = init_panel(args.panel_name, args.output_dir, directory=args.directory,
-                                patterns=args.pattern, force=args.force)
+                                patterns=args.pattern, force=args.force,
+                                write_instructions=args.with_instructions)
+        elif args.cmd == "setup":
+            result = setup_panel(
+                args.panel_name, args.output_dir, directory=args.directory, user=args.user,
+                apply=args.apply, destination_bucket=args.destination_bucket,
+                destination_prefix=args.destination_prefix,
+            )
         elif args.cmd == "selfcheck":
             result = selfcheck(
                 args.panel_name, user=args.user, apply=args.apply,

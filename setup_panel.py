@@ -3,7 +3,7 @@
 
 Run it from the panel's workspace root, using the copy inside the cloned repo:
 
-    python3 fathom-recovery-v1.7.0/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
+    python3 fathom-recovery-v1.7.1/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
 
 Steps (each prints PASS / FAIL / SKIP):
   1. panel name is valid
@@ -96,7 +96,8 @@ def main(argv=None) -> int:
             record("2b snippet", "FAIL", "panel_snippet.py not found in the clone")
 
     # 3. config + instructions (never overwrite an existing config)
-    rc, out = run([sys.executable, target, "init", "--panel-name", panel, "--output-dir", a.output_dir])
+    rc, out = run([sys.executable, target, "init", "--with-instructions",
+                   "--panel-name", panel, "--output-dir", a.output_dir])
     d = parse(out) or {}
     if rc == 0 and d.get("ok"):
         record("3 config", "PASS", f"wrote {fr.CONFIG_NAME} and {fr.INSTRUCTIONS_NAME}")

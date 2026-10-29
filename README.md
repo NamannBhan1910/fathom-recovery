@@ -73,14 +73,14 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
-### Fastest setup for a new panel (v1.7.0)
+### Fastest setup for a new panel (v1.7.1)
 
 Run these in the panel's workspace root (in Fathom, ask the panel's agent to run them). The clone goes
 into a folder named after the version, so running the lines again never fails with "already exists":
 
 ```
-[ -d fathom-recovery-v1.7.0 ] || git clone --depth 1 --branch v1.7.0 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.7.0
-python3 fathom-recovery-v1.7.0/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.7.1 ] || git clone --depth 1 --branch v1.7.1 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.7.1
+python3 fathom-recovery-v1.7.1/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone, writes `recovery_config.json` and
@@ -114,8 +114,16 @@ It works only as long as the agent follows it; a missed run leaves files local u
 not depend on the agent, run the same `sweep --config` command on a schedule.
 
 Re-running the install on a panel that already has `recovery_config.json` upgrades the code and
-keeps the config. `init` alone (`fathom_recovery.py init --panel-name "<Panel>"`) writes just the two
-files and never touches S3.
+keeps the config. `init` alone (`fathom_recovery.py init --panel-name "<Panel>"`) writes just
+`recovery_config.json` and never touches S3; add `--with-instructions` (v1.7.1+) to also write
+`RECOVERY_INSTRUCTIONS.md`. `setup_panel.py` and `sync_recovery.py` pass that flag for you.
+
+`fathom_recovery.py setup --panel-name "<Panel>" --output-dir outputs [--apply]` (v1.7.1+) runs the whole
+check from an already-installed script: panel name, config (an existing one is kept), output folder, user and
+panel folder lookup, `selfcheck`, `sweep` and `code-sweep`, one `[PASS]/[FAIL]` line per step. It is a dry run
+unless `--apply`; its only local writes are `recovery_config.json` (if missing), the output folder (if
+missing) and, with `--apply`, `.fathom_recovery/state.json` and `code_state.json`. It never writes
+`RECOVERY_INSTRUCTIONS.md`.
 
 ## Code and knowledge backup (v1.7.0)
 
@@ -214,7 +222,7 @@ Spelling matters except for case and extra spaces. Add a row before a panel star
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.7.0 --dest scripts --run-tests --panel-name "<Panel>"
+python3 sync_recovery.py --repo <git url> --ref v1.7.1 --dest scripts --run-tests --panel-name "<Panel>"
 ```
 (`sync_recovery.py` itself can be run again and again; only a plain `git clone` into an existing folder
 fails, so clone into a new or versioned folder name.)
