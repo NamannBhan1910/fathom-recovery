@@ -73,18 +73,19 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
-### Fastest setup for a new panel (v1.6.1+)
+### Fastest setup for a new panel (v1.7.0)
 
 Run these in the panel's workspace root (in Fathom, ask the panel's agent to run them). The clone goes
 into a folder named after the version, so running the lines again never fails with "already exists":
 
 ```
-[ -d fathom-recovery-v1.6.1 ] || git clone --depth 1 --branch v1.6.1 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.6.1
-python3 fathom-recovery-v1.6.1/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.7.0 ] || git clone --depth 1 --branch v1.7.0 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.7.0
+python3 fathom-recovery-v1.7.0/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone, writes `recovery_config.json` and
-`RECOVERY_INSTRUCTIONS.md` (an existing config is kept), runs `selfcheck`, and does a first `sweep`. Every
+`RECOVERY_INSTRUCTIONS.md` (an existing config is kept), runs `selfcheck`, and does a first `sweep` and a
+first `code-sweep` (`--skip-code` leaves that one out). Every
 step prints PASS / FAIL. Without `--apply` it is a dry run and writes nothing to S3. `--with-snippet`
 also copies `panel_snippet.py`. A FAIL mentioning AccessDenied or NoCredentialsError means that panel's
 runtime has no S3 permission on `6_Recovery/`. `RECOVERY_INSTRUCTIONS.md` now includes these setup lines, so
@@ -115,6 +116,44 @@ not depend on the agent, run the same `sweep --config` command on a schedule.
 Re-running the install on a panel that already has `recovery_config.json` upgrades the code and
 keeps the config. `init` alone (`fathom_recovery.py init --panel-name "<Panel>"`) writes just the two
 files and never touches S3.
+
+## Code and knowledge backup (v1.7.0)
+
+`sweep` backs up the **data files** a panel writes to `outputs/`. It is unchanged. `code-sweep` is a second,
+separate job that backs up everything else the panel is made of: Python, notebooks, markdown, JS/HTML, SQL,
+YAML/TOML/INI/JSON config, and the whole `knowledge/` folder.
+
+```
+s3://<bucket>/6_Recovery/<user>/<Panel Name>/code/<YYYYMMDDTHHMMSSZ>-<8 hex>/<relative/path/file>
+```
+
+| Question | Answer |
+|---|---|
+| What is scanned? | The whole workspace (the folder that holds `recovery_config.json`), recursively. |
+| Which files? | `py ipynb md markdown json js jsx ts tsx html htm css sql yaml yml toml ini cfg conf sh r txt`, `Dockerfile`, `Makefile`. Override with `code_patterns` in the config or `--pattern`. |
+| Folder paths | Kept. `scripts/setup_panel.py` and `fathom-recovery/setup_panel.py` are two different objects. |
+| One run folder | Each sweep that finds changes makes ONE new run folder holding only the new/changed files, plus a hidden `.fathom_manifest.json` (path, sha256, size per file). Nothing is overwritten, so every version is kept. |
+| What is skipped? | Hidden files/folders (`.git`, `.fathom_runtime`, `.fathom_recovery`, `.workspace_meta.json`), `__pycache__`, `node_modules`, `venv`, `site-packages`, symlinks, files over 10 MB (`--max-mb`), and the **data files inside `output_dir`** (the normal `sweep` owns those). Code files inside `outputs/` (for example `outputs/report.py`) are backed up. |
+| Secrets | A config-like file (`json yaml yml toml ini cfg conf txt`) whose name contains `secret`, `credential`, `password`, `token`, `api_key`, `private_key`, `service_account` or `id_rsa` is **not uploaded**. It is listed as `skipped_sensitive_name` so nothing is hidden silently. Code files (`tokenizer.py`) are never judged by name. File contents are not inspected, so do not keep secrets inside code or notes. |
+| State | `.fathom_recovery/code_state.json` (path -> sha256), outside `outputs/`. A file is recorded only after its upload verified (size, `sha256` metadata, content read back), so failures are retried next time. |
+| Safety | Reads local files, writes only copies to S3. No delete calls anywhere in the script. Dry run unless `--apply`. |
+
+```
+python3 scripts/fathom_recovery.py code-sweep   --config recovery_config.json            # dry run
+python3 scripts/fathom_recovery.py code-sweep   --config recovery_config.json --apply
+python3 scripts/fathom_recovery.py list-code    --config recovery_config.json [--run RUN_ID]
+python3 scripts/fathom_recovery.py restore-code --config recovery_config.json --target-dir restored_code [--run RUN_ID] [--apply]
+```
+
+`restore-code` only READS S3. It writes into `--target-dir` (default `restored_code/`, a NEW folder), keeps the
+original relative paths, re-checks every file's `sha256`, and refuses to replace an existing local file unless
+`--overwrite`. Without `--run` it rebuilds the newest version of every file (a full snapshot of the latest
+state); with `--run` it restores exactly that run. It never touches the live panel files by itself: look at the
+restored folder, then copy back what you want.
+
+Optional keys in `recovery_config.json`: `"code_patterns": ["*.py", "*.md"]` and
+`"code_exclude_dirs": ["uploads", "tmp"]` (folder names to skip at any depth).
+`list` (data) no longer shows code runs; use `list-code`.
 
 ## Finding and restoring
 
@@ -147,6 +186,8 @@ Offline only; nothing touches S3.
   An exact spelling always wins; if only different-case folders exist and there are several (`NBHAN` and `NbHan`),
   the call fails and the exact spelling must be used. If the listing is not permitted, the name is used as given
   with a warning. Let `resolve_user()` pick the user (or set `RECOVERY_USER`) instead of hardcoding one.
+- `fathom_recovery.py` also contains `CODE_BACKUP = "1"` (v1.7.0+): `grep -c 'CODE_BACKUP = "1"' scripts/fathom_recovery.py`
+  is 1 when the copy can run `code-sweep`.
 - `fathom_recovery.py` contains the line `LAYOUT = "user/panel"`. A panel can check which layout its copy
   writes with `grep -c 'LAYOUT = "user/panel"' scripts/fathom_recovery.py` (1 = current, 0 = older panel-first).
 
@@ -173,7 +214,7 @@ Spelling matters except for case and extra spaces. Add a row before a panel star
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.6.1 --dest scripts --run-tests --panel-name "<Panel>"
+python3 sync_recovery.py --repo <git url> --ref v1.7.0 --dest scripts --run-tests --panel-name "<Panel>"
 ```
 (`sync_recovery.py` itself can be run again and again; only a plain `git clone` into an existing folder
 fails, so clone into a new or versioned folder name.)

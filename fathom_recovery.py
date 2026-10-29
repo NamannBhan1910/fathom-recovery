@@ -44,6 +44,20 @@ CLI (dry run unless --apply is given)
     python3 fathom_recovery.py restore --recovery-path "<user>/<Panel>/<run>/<file>" \
                                        --target-bucket B --target-key K [--overwrite] [--apply]
 
+Code / knowledge backup (v1.7.0)
+--------------------------------
+    python3 fathom_recovery.py code-sweep    --config recovery_config.json [--apply]
+    python3 fathom_recovery.py restore-code  --config recovery_config.json [--run R] [--target-dir D] [--apply]
+
+`code-sweep` scans the WHOLE workspace (py, ipynb, md, json, js, html, sql, yaml, ... including
+knowledge/) and uploads new/changed files to
+    <prefix><user>/<Panel>/code/<YYYYMMDDTHHMMSSZ>-<8 hex>/<relative/path/file>
+with the folder structure kept, plus a `_manifest.json` per run. One run folder per sweep. State is
+kept in .fathom_recovery/code_state.json. Hidden files/folders (.git, .fathom_runtime, ...), __pycache__,
+node_modules and files over 10 MB are skipped; data files that the normal `sweep` already backs up
+from outputs/ are not uploaded twice. It only reads files; nothing local or in S3 is ever deleted.
+`restore-code` downloads a run's files into a NEW local folder and never overwrites unless --overwrite.
+
 Output never prints bucket names (they are redacted).
 """
 from __future__ import annotations
@@ -65,8 +79,9 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 LAYOUT = "user/panel"  # marker: <prefix>/<user>/<panel>/<run>/<file>. Panels grep for this line.
+CODE_BACKUP = "1"  # marker: this script has code-sweep / restore-code. Panels grep for this line.
 REPO_URL = "https://github.com/NamannBhan1910/fathom-recovery.git"
 
 DESTINATION_BUCKET = os.environ.get("RECOVERY_DESTINATION_BUCKET", "mosaic-derivatives-margining")
@@ -505,6 +520,8 @@ def list_recoveries(
                 continue  # folder marker
             rel = key[len(root):]
             parts = rel.split("/")[2:]  # drop user, panel
+            if parts and parts[0] == CODE_FOLDER and len(parts) > 1:
+                continue  # code/knowledge backups (v1.7.0) are listed by list_code(), not mixed into data runs
             if len(parts) >= 2:
                 run_id, fname = parts[0], "/".join(parts[1:])
             else:
@@ -809,6 +826,315 @@ def sweep(
     return {"ok": counts["failed"] == 0, "action": "sweep", "applied": apply, **counts, "files": files}
 
 
+# ------------------------------------------------- code + knowledge backup (v1.7.0)
+# Separate from `sweep` (which backs up data files in outputs/ and is unchanged). The code sweep walks
+# the WHOLE workspace and keeps folder paths:
+#     <prefix><user>/<Panel>/code/<YYYYMMDDTHHMMSSZ>-<8 hex>/<relative/path/file>
+# One run folder per sweep holds only the files that are new/changed in that sweep, plus a manifest.
+CODE_STATE_DIR = ".fathom_recovery"
+CODE_STATE_NAME = "code_state.json"
+CODE_FOLDER = "code"
+CODE_MANIFEST_NAME = ".fathom_manifest.json"  # hidden name: can never collide with a swept workspace file
+CODE_MAX_BYTES = 10 * 1024 * 1024
+CODE_DEFAULT_PATTERNS = (
+    "*.py", "*.ipynb", "*.md", "*.markdown", "*.json", "*.js", "*.jsx", "*.ts", "*.tsx", "*.html", "*.htm",
+    "*.css", "*.sql", "*.yaml", "*.yml", "*.toml", "*.ini", "*.cfg", "*.conf", "*.sh", "*.r", "*.txt",
+    "dockerfile", "makefile",
+)
+_CODE_SKIP_DIRS = {"__pycache__", "node_modules", "venv", "site-packages"}
+# Config-like files whose NAME suggests secrets are not uploaded (they are reported, so nothing is hidden).
+_CODE_CONFIG_EXTS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".txt"}
+_CODE_SENSITIVE_WORDS = ("secret", "credential", "password", "passwd", "token", "private_key", "service_account",
+                         "id_rsa", "apikey", "api_key")
+
+
+def _is_sensitive_name(name: str) -> bool:
+    low = name.lower()
+    return os.path.splitext(low)[1] in _CODE_CONFIG_EXTS and any(w in low for w in _CODE_SENSITIVE_WORDS)
+
+
+def _walk_code_files(root: Path, exclude_dirs: set[str]):
+    """Yield workspace files, pruning hidden / generated folders before descending (never follows symlinks)."""
+    skip = _CODE_SKIP_DIRS | exclude_dirs
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in skip)
+        for fn in sorted(filenames):
+            if not fn.startswith("."):
+                yield Path(dirpath) / fn
+
+
+def _put_verified(client: Any, bucket: str, key: str, body: bytes, sha: str, content_type: str | None = None) -> bool:
+    """Write one object with sha256 metadata, then verify size, metadata and the content read back."""
+    client.put_object(
+        Bucket=bucket, Key=key, Body=body,
+        ContentType=content_type or mimetypes.guess_type(key)[0] or "application/octet-stream",
+        Metadata={"sha256": sha},
+    )
+    head = _head_object(client, bucket, key)
+    return (head["size_bytes"] == len(body) and head["metadata"].get("sha256") == sha
+            and _sha256_of_object(client, bucket, key) == sha)
+
+
+def code_sweep(
+    directory: str | os.PathLike,
+    panel_name: str,
+    *,
+    patterns: tuple[str, ...] | list[str] | None = None,
+    exclude_dirs: tuple[str, ...] | list[str] = (),
+    data_dir: str | os.PathLike | None = None,
+    data_patterns: tuple[str, ...] | list[str] = SWEEP_DEFAULT_PATTERNS,
+    state_path: str | os.PathLike | None = None,
+    user: str | None = None,
+    apply: bool = False,
+    max_bytes: int = CODE_MAX_BYTES,
+    destination_bucket: str = DESTINATION_BUCKET,
+    destination_prefix: str = DESTINATION_PREFIX,
+    s3: Any | None = None,
+) -> dict[str, Any]:
+    """Back up the panel's code, notebooks, docs and knowledge/ files (new or changed since the last run).
+
+    Scans `directory` (the whole workspace) and uploads to <prefix><user>/<panel>/code/<run>/<relative path>.
+    Skipped: hidden files/folders (.git, .fathom_runtime, .fathom_recovery, ...), __pycache__, node_modules,
+    venv, site-packages, symlinks, files over `max_bytes`, config-like files whose name looks secret
+    (reported, not uploaded), and the data files under `data_dir` that the normal `sweep` already covers.
+    State (relative path -> sha256) lives in <directory>/.fathom_recovery/code_state.json, outside any data
+    folder, and a file is recorded only after its upload verified. Read-only on the workspace; nothing is ever
+    deleted. Dry run unless apply=True (nothing uploaded, state untouched).
+    """
+    _require_panel(panel_name)
+    root = Path(directory).resolve()
+    if not root.is_dir():
+        raise ValueError("directory does not exist")
+    state_file = Path(state_path).resolve() if state_path else root / CODE_STATE_DIR / CODE_STATE_NAME
+    state = _load_state(state_file)
+    pats = [p.lower() for p in (patterns or CODE_DEFAULT_PATTERNS)]
+    dpats = [p.lower() for p in (data_patterns or SWEEP_DEFAULT_PATTERNS)]
+    data_root = Path(data_dir).resolve() if data_dir else None
+
+    client = s3
+    panel_folder, user_folder, warning = panel_name, user, None
+    resolved, run_id = False, None
+    files: list[dict[str, Any]] = []
+    uploaded_meta: list[dict[str, Any]] = []
+    counts = {"scanned": 0, "uploaded": 0, "would_upload": 0, "unchanged": 0, "failed": 0,
+              "skipped_sensitive": 0, "skipped_large": 0}
+    for p in _walk_code_files(root, {str(x).strip("/") for x in exclude_dirs}):
+        if p.is_symlink() or p.resolve() == state_file or p.name.endswith(".tmp"):
+            continue
+        low = p.name.lower()
+        if not any(fnmatch.fnmatchcase(low, pat) for pat in pats):
+            continue
+        if data_root and data_root in p.resolve().parents and any(fnmatch.fnmatchcase(low, d) for d in dpats):
+            continue  # a data file in the output folder: the normal sweep owns it
+        rel = "/".join(p.relative_to(root).parts)
+        if _is_sensitive_name(p.name):
+            counts["skipped_sensitive"] += 1
+            files.append({"file": rel, "action": "skipped_sensitive_name"})
+            continue
+        try:
+            size = p.stat().st_size
+            if size > max_bytes:
+                counts["skipped_large"] += 1
+                files.append({"file": rel, "action": "skipped_large", "size_bytes": size})
+                continue
+            data = p.read_bytes()  # read once: the hash and the upload use the same bytes
+        except OSError as exc:
+            counts["scanned"] += 1
+            counts["failed"] += 1
+            files.append({"file": rel, "action": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        counts["scanned"] += 1
+        sha = hashlib.sha256(data).hexdigest()
+        if state.get(rel) == sha:
+            counts["unchanged"] += 1
+            continue  # unchanged files are counted, not listed (a workspace can have hundreds)
+        if not apply:
+            counts["would_upload"] += 1
+            files.append({"file": rel, "action": "would_upload", "size_bytes": len(data)})
+            continue
+        try:
+            client = client or boto3.client("s3")
+            if not resolved:
+                panel_folder, warning, user_folder = _panel_folder(
+                    panel_name, client, destination_bucket, destination_prefix, user)
+                run_id = make_run_folder()
+                resolved = True
+            key = f"{_clean_prefix(destination_prefix)}{user_folder}/{panel_folder}/{CODE_FOLDER}/{run_id}/{rel}"
+            ok = _put_verified(client, destination_bucket, key, data, sha)
+        except Exception as exc:  # noqa: BLE001 - one bad file must not stop the sweep
+            counts["failed"] += 1
+            files.append({"file": rel, "action": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        if ok:
+            state[rel] = sha
+            counts["uploaded"] += 1
+            uploaded_meta.append({"path": rel, "sha256": sha, "size_bytes": len(data)})
+            files.append({"file": rel, "action": "uploaded", "size_bytes": len(data)})
+        else:
+            counts["failed"] += 1
+            files.append({"file": rel, "action": "failed", "error": "upload not verified"})
+
+    result: dict[str, Any] = {"ok": counts["failed"] == 0, "action": "code-sweep", "applied": apply, **counts}
+    if apply and uploaded_meta:
+        run_prefix = f"{_clean_prefix(destination_prefix)}{user_folder}/{panel_folder}/{CODE_FOLDER}/{run_id}/"
+        manifest = json.dumps({
+            "fathom_recovery_version": __version__, "kind": "code-run", "panel": panel_folder,
+            "user": user_folder, "run_id": run_id,
+            "created_utc": datetime.now(timezone.utc).isoformat(), "files": uploaded_meta,
+        }, indent=2, sort_keys=True).encode("utf-8")
+        try:
+            mok = _put_verified(client, destination_bucket, run_prefix + CODE_MANIFEST_NAME, manifest,
+                                hashlib.sha256(manifest).hexdigest(), "application/json")
+        except Exception as exc:  # noqa: BLE001
+            mok = False
+            result["manifest_error"] = f"{type(exc).__name__}: {exc}"
+        result["manifest_ok"] = mok
+        if not mok:
+            result["ok"] = False  # the files are safe in S3 and recorded in state; restore does not need the manifest
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        _save_state(state_file, state)
+    if run_id:
+        result["run_id"] = run_id
+        result["recovery_folder"] = f"{user_folder}/{panel_folder}/{CODE_FOLDER}/{run_id}/"
+    if warning:
+        result["warning"] = warning
+    result["files"] = files
+    return result
+
+
+def list_code(
+    panel_name: str,
+    *,
+    user: str | None = None,
+    destination_bucket: str = DESTINATION_BUCKET,
+    destination_prefix: str = DESTINATION_PREFIX,
+    s3: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Every code/knowledge object backed up for this user's panel (read-only): run_id, path, size, key."""
+    _require_panel(panel_name)
+    client = s3 or boto3.client("s3")
+    root = _clean_prefix(destination_prefix)
+    who = resolve_user_folder(user, destination_bucket=destination_bucket,
+                              destination_prefix=destination_prefix, s3=client)
+    panel = resolve_panel_folder(panel_name, user=who, destination_bucket=destination_bucket,
+                                 destination_prefix=destination_prefix, s3=client)
+    prefix = f"{root}{who}/{panel}/{CODE_FOLDER}/"
+    out: list[dict[str, Any]] = []
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=destination_bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            run_id, _, path = key[len(prefix):].partition("/")
+            if not run_id or not path or path == CODE_MANIFEST_NAME:
+                continue
+            lm = obj.get("LastModified")
+            out.append({"run_id": run_id, "path": path, "size_bytes": obj.get("Size"), "key": key,
+                        "recovery_path": key[len(root):], "user": who, "panel": panel,
+                        "last_modified_utc": lm.astimezone(timezone.utc).isoformat() if lm else None})
+    out.sort(key=lambda r: (r["run_id"], r["path"]), reverse=True)
+    return out
+
+
+def _run_time(client: Any, bucket: str, run_prefix: str, run_id: str) -> str:
+    """ISO time of a code run: the manifest's created_utc, else the timestamp inside the run id."""
+    try:
+        body = client.get_object(Bucket=bucket, Key=run_prefix + CODE_MANIFEST_NAME)["Body"].read()
+        created = json.loads(body).get("created_utc")
+        if isinstance(created, str) and created:
+            return created
+    except Exception:  # noqa: BLE001 - a missing/unreadable manifest only weakens the ordering
+        pass
+    try:
+        return datetime.strptime(run_id.split("-")[0], "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return ""
+
+
+def summarize_code_runs(objs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group list_code() rows into runs (newest first) with file count and total size."""
+    runs: dict[str, dict[str, Any]] = {}
+    for o in objs:
+        r = runs.setdefault(o["run_id"], {"run_id": o["run_id"], "files": 0, "size_bytes": 0})
+        r["files"] += 1
+        r["size_bytes"] += o.get("size_bytes") or 0
+    return sorted(runs.values(), key=lambda r: r["run_id"], reverse=True)
+
+
+def restore_code(
+    panel_name: str,
+    target_dir: str | os.PathLike,
+    *,
+    user: str | None = None,
+    run: str | None = None,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    destination_bucket: str = DESTINATION_BUCKET,
+    destination_prefix: str = DESTINATION_PREFIX,
+    s3: Any | None = None,
+) -> dict[str, Any]:
+    """Download backed-up code/knowledge files into a LOCAL folder (S3 is only read).
+
+    run=None  -> the newest backed-up version of every file (a full snapshot of the latest state).
+    run="R"   -> exactly the files uploaded in run R.
+    Files are written under target_dir with their original relative paths. An existing local file is never
+    replaced unless overwrite=True. Every file's sha256 is re-checked against the value stored at backup time.
+    Point target_dir at a NEW folder; this never touches the live panel files by itself.
+    """
+    client = s3 or boto3.client("s3")
+    objs = list_code(panel_name, user=user, destination_bucket=destination_bucket,
+                     destination_prefix=destination_prefix, s3=client)
+    if run:
+        chosen = [o for o in objs if o["run_id"] == run]
+        if not chosen:
+            raise ValueError(f"no code files found for run {run!r}")
+    else:
+        by_path: dict[str, list[dict[str, Any]]] = {}
+        for o in objs:
+            by_path.setdefault(o["path"], []).append(o)
+        # run ids only have 1-second resolution (+ random hex), so runs that both contain the same file are
+        # ordered by the manifest's created_utc (microseconds); no manifest -> the time inside the run id
+        contested = {o["run_id"]: o["key"][: -len(o["path"])]
+                     for rows in by_path.values() if len(rows) > 1 for o in rows}
+        when = {rid: _run_time(client, destination_bucket, pfx, rid) for rid, pfx in contested.items()}
+        chosen = sorted((max(rows, key=lambda o: (when.get(o["run_id"], ""), o["run_id"]))
+                         for rows in by_path.values()), key=lambda o: o["path"])
+    target = Path(target_dir).resolve()
+    counts = {"restored": 0, "would_restore": 0, "refused_exists": 0, "failed": 0}
+    files: list[dict[str, Any]] = []
+    for o in chosen:
+        rel = o["path"]
+        segs = rel.split("/")
+        dest = (target / rel).resolve()
+        if any(s in {"", ".", ".."} for s in segs) or target not in dest.parents:
+            counts["failed"] += 1
+            files.append({"file": rel, "action": "failed", "error": "unsafe path"})
+            continue
+        if dest.exists() and not overwrite:
+            counts["refused_exists"] += 1
+            files.append({"file": rel, "action": "refused_exists", "run_id": o["run_id"]})
+            continue
+        if dry_run:
+            counts["would_restore"] += 1
+            files.append({"file": rel, "action": "would_restore", "run_id": o["run_id"],
+                          "size_bytes": o["size_bytes"]})
+            continue
+        try:
+            expected = _head_object(client, destination_bucket, o["key"])["metadata"].get("sha256")
+            body = client.get_object(Bucket=destination_bucket, Key=o["key"])["Body"].read()
+            if expected and hashlib.sha256(body).hexdigest() != expected:
+                raise RuntimeError("sha256 mismatch after download")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(body)
+        except Exception as exc:  # noqa: BLE001 - one bad file must not stop the restore
+            counts["failed"] += 1
+            files.append({"file": rel, "action": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        counts["restored"] += 1
+        files.append({"file": rel, "action": "restored", "run_id": o["run_id"], "size_bytes": len(body)})
+    return {"ok": counts["failed"] == 0, "action": "restore-code", "dry_run": dry_run,
+            "run": run or "latest-per-file", "target_dir": str(target), **counts, "files": files}
+
+
 # ------------------------------------------------- panel config + instruction
 CONFIG_NAME = "recovery_config.json"
 INSTRUCTIONS_NAME = "RECOVERY_INSTRUCTIONS.md"
@@ -833,6 +1159,10 @@ def load_config(path: str | os.PathLike) -> dict[str, Any]:
     pats = cfg.get("patterns")
     if pats is not None and not (isinstance(pats, list) and all(isinstance(x, str) for x in pats)):
         raise ValueError("config 'patterns' must be a list of glob strings")
+    for key in ("code_patterns", "code_exclude_dirs"):
+        val = cfg.get(key)
+        if val is not None and not (isinstance(val, list) and all(isinstance(x, str) for x in val)):
+            raise ValueError(f"config '{key}' must be a list of strings")
     return cfg
 
 
@@ -860,14 +1190,21 @@ Rule (follow it every time, without being asked):
        python3 scripts/fathom_recovery.py sweep --config {config_path} --apply
 
    then tell me how many files were uploaded, unchanged, or failed.
-2. At the start of every session, run the same command once. It uploads anything a previous
-   run missed and skips files that are already uploaded. If scripts/fathom_recovery.py is missing,
-   do the Setup first.
-3. If it reports a failure or AccessDenied, tell me. Do not retry silently or skip it.
-4. Never delete anything in S3 and never edit {config_path} yourself unless I ask.
+2. Whenever you create or change code, notebooks, docs or knowledge files in this panel
+   (py, ipynb, md, js, html, sql, yaml, ... and everything under knowledge/), as the LAST step of that
+   task run:
 
-Files land in S3 under 6_Recovery/<user>/<panel folder>/<timestamp>-<8 hex>/<file>.
-Nothing uploads by itself: this rule is what triggers the upload.
+       python3 scripts/fathom_recovery.py code-sweep --config {config_path} --apply
+
+   then tell me how many files were uploaded, unchanged, or failed.
+3. At the start of every session, run BOTH commands once. They upload anything a previous run missed
+   and skip files that are already uploaded. If scripts/fathom_recovery.py is missing, do the Setup first.
+4. If either reports a failure or AccessDenied, tell me. Do not retry silently or skip it.
+5. Never delete anything in S3 and never edit {config_path} yourself unless I ask.
+
+Data files land in S3 under 6_Recovery/<user>/<panel folder>/<timestamp>-<8 hex>/<file>.
+Code and knowledge files land under 6_Recovery/<user>/<panel folder>/code/<timestamp>-<8 hex>/<folder>/<file>.
+Nothing uploads by itself: these rules are what trigger the upload.
 """
 
 
@@ -956,6 +1293,40 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument("--apply", action="store_true", help="actually upload (default is dry run)")
     common(sw)
 
+    cs = sub.add_parser("code-sweep", help="back up code, notebooks, docs and knowledge/ (dry run unless --apply)")
+    cs.add_argument("--panel-name", default=None, help="required unless --config is given")
+    cs.add_argument("--config", default=None,
+                    help="recovery_config.json (panel_name, output_dir, optional code_patterns / code_exclude_dirs)")
+    cs.add_argument("--dir", default=None, help="folder to scan (default: the config file's folder, else .)")
+    cs.add_argument("--pattern", action="append", default=None,
+                    help="glob such as *.py (repeatable; default: py, ipynb, md, json, js, html, sql, yaml, ...)")
+    cs.add_argument("--exclude-dir", action="append", default=None,
+                    help="top-level or nested folder name to skip, e.g. uploads (repeatable)")
+    cs.add_argument("--max-mb", type=float, default=CODE_MAX_BYTES / (1024 * 1024),
+                    help="skip files larger than this (default 10)")
+    cs.add_argument("--state-file", default=None, help="default: <dir>/.fathom_recovery/code_state.json")
+    cs.add_argument("--user", default=None)
+    cs.add_argument("--apply", action="store_true", help="actually upload (default is dry run)")
+    common(cs)
+
+    lc = sub.add_parser("list-code", help="list backed-up code/knowledge runs for a panel (read-only)")
+    lc.add_argument("--panel-name", default=None, help="required unless --config is given")
+    lc.add_argument("--config", default=None)
+    lc.add_argument("--user", default=None)
+    lc.add_argument("--run", default=None, help="show the files of one run instead of the run summary")
+    lc.add_argument("--limit", type=int, default=50)
+    common(lc)
+
+    rc_ = sub.add_parser("restore-code", help="download backed-up code/knowledge into a LOCAL folder")
+    rc_.add_argument("--panel-name", default=None, help="required unless --config is given")
+    rc_.add_argument("--config", default=None)
+    rc_.add_argument("--run", default=None, help="one run id (default: newest version of every file)")
+    rc_.add_argument("--target-dir", default="restored_code", help="local folder to write into (default restored_code)")
+    rc_.add_argument("--overwrite", action="store_true", help="replace existing local files (default: refuse)")
+    rc_.add_argument("--user", default=None)
+    rc_.add_argument("--apply", action="store_true", help="actually write files (default is dry run)")
+    common(rc_)
+
     ini = sub.add_parser("init", help="write recovery_config.json + RECOVERY_INSTRUCTIONS.md (local files only)")
     ini.add_argument("--panel-name", required=True)
     ini.add_argument("--output-dir", default="outputs", help="folder this panel writes data files to")
@@ -990,8 +1361,6 @@ def main(argv: list[str] | None = None) -> int:
             result = {"ok": True, "panel": args.panel_name, "layout": "legacy" if args.legacy else "user/panel",
                       "total": len(rows), "shown": rows[: args.limit]}
         elif args.cmd == "upload":
-            from pathlib import Path
-
             result = upload_to_recovery(
                 Path(args.file), args.filename, panel_name=args.panel_name, user=args.user,
                 dry_run=not args.apply,
@@ -1012,6 +1381,42 @@ def main(argv: list[str] | None = None) -> int:
                 apply=args.apply, destination_bucket=args.destination_bucket,
                 destination_prefix=args.destination_prefix,
             )
+        elif args.cmd in ("code-sweep", "list-code", "restore-code"):
+            cfg = load_config(args.config) if args.config else {}
+            panel = args.panel_name or cfg.get("panel_name")
+            if not panel:
+                raise ValueError(f"{args.cmd} needs --panel-name or --config")
+            cfg_dir = Path(args.config).resolve().parent if args.config else Path(".").resolve()
+            if args.cmd == "code-sweep":
+                scan_dir = args.dir or str(cfg_dir)
+                out_cfg = cfg.get("output_dir_resolved")
+                result = code_sweep(
+                    scan_dir, panel,
+                    patterns=args.pattern or cfg.get("code_patterns"),
+                    exclude_dirs=args.exclude_dir or cfg.get("code_exclude_dirs") or (),
+                    data_dir=out_cfg if out_cfg and not args.dir else None,
+                    data_patterns=cfg.get("patterns") or SWEEP_DEFAULT_PATTERNS,
+                    state_path=args.state_file, user=args.user, apply=args.apply,
+                    max_bytes=int(args.max_mb * 1024 * 1024),
+                    destination_bucket=args.destination_bucket, destination_prefix=args.destination_prefix,
+                )
+            elif args.cmd == "list-code":
+                rows = list_code(panel, user=args.user, destination_bucket=args.destination_bucket,
+                                 destination_prefix=args.destination_prefix)
+                if args.run:
+                    rows = [r for r in rows if r["run_id"] == args.run]
+                    result = {"ok": True, "panel": panel, "run": args.run, "total_files": len(rows),
+                              "files": [{"path": r["path"], "size_bytes": r["size_bytes"]} for r in rows[: args.limit]]}
+                else:
+                    runs = summarize_code_runs(rows)
+                    result = {"ok": True, "panel": panel, "total_runs": len(runs), "total_files": len(rows),
+                              "runs": runs[: args.limit]}
+            else:
+                result = restore_code(
+                    panel, args.target_dir, user=args.user, run=args.run, overwrite=args.overwrite,
+                    dry_run=not args.apply, destination_bucket=args.destination_bucket,
+                    destination_prefix=args.destination_prefix,
+                )
         elif args.cmd == "init":
             result = init_panel(args.panel_name, args.output_dir, directory=args.directory,
                                 patterns=args.pattern, force=args.force)

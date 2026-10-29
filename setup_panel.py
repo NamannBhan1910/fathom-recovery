@@ -3,7 +3,7 @@
 
 Run it from the panel's workspace root, using the copy inside the cloned repo:
 
-    python3 fathom-recovery-v1.6.1/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
+    python3 fathom-recovery-v1.7.0/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
 
 Steps (each prints PASS / FAIL / SKIP):
   1. panel name is valid
@@ -11,8 +11,10 @@ Steps (each prints PASS / FAIL / SKIP):
      exactly the tag that was cloned; no network needed)
   3. write recovery_config.json + RECOVERY_INSTRUCTIONS.md (an existing config is kept, never overwritten)
   4. selfcheck (read-only; with --apply it writes and verifies one small probe file in S3)
-  5. sweep of the output folder (dry run; with --apply it uploads new/changed files)
+  5. sweep of the output folder (dry run; with --apply it uploads new/changed data files)
   6. the output folder named in the config exists (created if missing)
+  7. code-sweep of the whole workspace: code, notebooks, docs and knowledge/ (dry run; with --apply it
+     uploads new/changed files). Skip it with --skip-code.
 
 Dry run by default: nothing is written to S3 unless --apply is given. Safe to run again at any time.
 Exit code 0 only if no step failed.
@@ -56,6 +58,7 @@ def main(argv=None) -> int:
     p.add_argument("--apply", action="store_true", help="write to S3 (selfcheck probe + sweep upload)")
     p.add_argument("--with-snippet", action="store_true", help="also copy panel_snippet.py into the panel")
     p.add_argument("--skip-selfcheck", action="store_true")
+    p.add_argument("--skip-code", action="store_true", help="do not run the code/knowledge sweep (step 7)")
     a = p.parse_args(argv)
 
     src = os.path.join(HERE, "fathom_recovery.py")
@@ -145,6 +148,24 @@ def main(argv=None) -> int:
         if errs:
             detail += " | " + errs[0][:160]
         record("5 sweep" + (" --apply" if a.apply else " (dry run)"), "PASS" if d["ok"] else "FAIL", detail)
+
+    # 7. code + knowledge sweep (whole workspace)
+    if a.skip_code:
+        record("7 code-sweep", "SKIP", "--skip-code")
+    else:
+        cmd = [sys.executable, target, "code-sweep", "--config", fr.CONFIG_NAME] + (["--apply"] if a.apply else [])
+        rc, out = run(cmd)
+        d = parse(out)
+        if d is None:
+            record("7 code-sweep", "FAIL", out[-300:])
+        else:
+            detail = (f"scanned={d['scanned']} uploaded={d['uploaded']} would_upload={d['would_upload']} "
+                      f"unchanged={d['unchanged']} failed={d['failed']} skipped_sensitive={d['skipped_sensitive']} "
+                      f"skipped_large={d['skipped_large']}")
+            errs = [f.get("error", "") for f in d.get("files", []) if f.get("action") == "failed"]
+            if errs:
+                detail += " | " + errs[0][:160]
+            record("7 code-sweep" + (" --apply" if a.apply else " (dry run)"), "PASS" if d["ok"] else "FAIL", detail)
 
     failed = [r for r in results if r[1] == "FAIL"]
     print("\nALL STEPS PASSED" if not failed else "\nSOME STEPS FAILED - fix the first FAIL above")
