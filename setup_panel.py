@@ -3,7 +3,7 @@
 
 Run it from the panel's workspace root, using the copy inside the cloned repo:
 
-    python3 fathom-recovery-v1.7.1/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
+    python3 fathom-recovery-v1.7.2/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
 
 Steps (each prints PASS / FAIL / SKIP):
   1. panel name is valid

@@ -43,7 +43,7 @@ def sweep_now(directory: str = ".", patterns=None) -> dict:
 
     Call this once at the end of the panel's generation code. Files already uploaded and
     unchanged are skipped, so it is safe to call after every run.
-    `patterns` defaults to the same list as the `sweep` command (csv, xlsx, xls, json, parquet, txt).
+    `patterns` defaults to the same list as the `sweep` command (csv, xlsx, xls, json, parquet, txt, pdf).
     """
     from fathom_recovery import SWEEP_DEFAULT_PATTERNS, sweep
 

@@ -366,6 +366,29 @@ class Sweep(unittest.TestCase):
         self.assertEqual([f["file"] for f in r["files"]], ["a.csv"])
         r2 = fr.sweep(self.root, "P", patterns=["*.md"], apply=True, destination_bucket="rec", s3=s3)
         self.assertEqual([f["file"] for f in r2["files"]], ["note.md"])
+    def test_subfolders_of_the_data_folder_are_kept_in_s3(self):
+        self.w("top.csv", b"1")
+        self.w("reports/2026/q1.csv", b"2")
+        self.w("reports/summary.json", b"{}")
+        s3 = FakeS3()
+        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
+        self.assertEqual((r["uploaded"], r["ok"]), (3, True), r)
+        tails = sorted(k.split("/", 4)[4] for (_, k) in s3.objs)  # <prefix>/<user>/<panel>/<run>/<this part>
+        self.assertEqual(tails, ["reports/2026/q1.csv", "reports/summary.json", "top.csv"])
+        listed = fr.list_recoveries("P", destination_bucket="rec", s3=s3)
+        self.assertEqual(sorted(x["filename"] for x in listed), ["reports/2026/q1.csv", "reports/summary.json", "top.csv"])
+
+    def test_pdf_files_are_swept_case_insensitively(self):
+        self.assertIn("*.pdf", fr.SWEEP_DEFAULT_PATTERNS)
+        self.w("report.pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        self.w("sub/SCAN.PDF", b"%PDF-1.7")
+        s3 = FakeS3()
+        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
+        self.assertEqual((r["uploaded"], r["ok"]), (2, True), r)
+        self.assertEqual(sorted(f["file"] for f in r["files"]), ["report.pdf", "sub/SCAN.PDF"])
+        self.assertTrue(all(k.endswith((".pdf", ".PDF")) for (_, k) in s3.objs))
+
+
 
     def test_state_file_not_uploaded_and_non_recursive(self):
         self.w("a.json", b"{}")
@@ -979,7 +1002,79 @@ class CodeSweep(unittest.TestCase):
         run = r["run_id"]
         self.assertEqual(keys, sorted(f"6_Recovery/tester/Code Panel/code/{run}/{p}" for p in
                                       ("scripts/setup_panel.py", "fathom-recovery/setup_panel.py", "main.py")))
-        self.assertRegex(run, r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+        self.assertRegex(run, r"^\d{4}-\d{2}-\d{2}$")  # v1.7.2: one folder per UTC day
+        self.assertEqual(run, fr.make_day_folder())
+
+    def test_nested_folders_are_recreated_under_the_day_folder(self):
+        self.w("a/b/c/deep.py", "d")
+        self.w("a/top.json", "{}")
+        self.w("root.md", "r")
+        s3 = FakeS3()
+        r = self.sweep(s3)
+        day = r["run_id"]
+        self.assertEqual(self.code_keys(s3), sorted(f"6_Recovery/tester/Code Panel/code/{day}/{p}" for p in
+                                                    ("a/b/c/deep.py", "a/top.json", "root.md")))
+        self.assertEqual(r["recovery_folder"], f"tester/Code Panel/code/{day}/")
+
+    def test_many_sweeps_on_one_day_make_exactly_one_folder(self):
+        self.w("a.py", "1")
+        s3 = FakeS3()
+        r1 = self.sweep(s3)
+        self.w("b.py", "2")
+        self.w("sub/c.json", "{}")
+        r2 = self.sweep(s3)
+        self.w("a.py", "11")
+        r3 = self.sweep(s3)
+        self.assertEqual({r1["run_id"], r2["run_id"], r3["run_id"]}, {fr.make_day_folder()})
+        days = {k.split("/code/")[1].split("/")[0] for (_, k) in s3.objs}
+        self.assertEqual(days, {fr.make_day_folder()})
+        keys = self.code_keys(s3)
+        self.assertEqual([k.split("/code/")[1].split("/", 1)[1] for k in keys], ["a.py", "b.py", "sub/c.json"])
+        a = [o for (_, k), o in s3.objs.items() if k.endswith("/a.py")][0]
+        self.assertEqual(a["data"], b"11")  # the day's copy holds the latest content
+        mkeys = [k for (_, k) in s3.objs if k.endswith(fr.CODE_MANIFEST_NAME)]
+        self.assertEqual(len(mkeys), 1)
+        m = __import__("json").loads(s3.objs[("rec", mkeys[0])]["data"])
+        self.assertEqual([f["path"] for f in m["files"]], ["a.py", "b.py", "sub/c.json"])  # merged, none dropped
+        self.assertEqual(m["files"][0]["sha256"], hashlib.sha256(b"11").hexdigest())
+
+    def test_a_new_day_gets_a_new_folder_with_a_full_snapshot(self):
+        self.w("a.py", "1")
+        self.w("sub/b.py", "2")
+        s3 = FakeS3()
+        real = fr.make_day_folder
+        self.addCleanup(setattr, fr, "make_day_folder", real)
+        fr.make_day_folder = lambda now=None: "2026-01-01"
+        r1 = self.sweep(s3)
+        r1b = self.sweep(s3)
+        self.assertEqual((r1["uploaded"], r1b["uploaded"], r1b["unchanged"]), (2, 0, 2))
+        fr.make_day_folder = lambda now=None: "2026-01-02"
+        r2 = self.sweep(s3)
+        self.assertEqual((r2["run_id"], r2["uploaded"], r2["unchanged"]), ("2026-01-02", 2, 0))
+        self.assertEqual(sorted(k.split("/code/")[1] for k in self.code_keys(s3)),
+                         ["2026-01-01/a.py", "2026-01-01/sub/b.py", "2026-01-02/a.py", "2026-01-02/sub/b.py"])
+
+    def test_pdf_in_workspace_is_backed_up_with_pdf_content_type(self):
+        pdf = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n%%EOF\n"  # binary bytes must round-trip
+        self.w("report.pdf", pdf)
+        self.w("docs/Upper.PDF", pdf + b"2")
+        s3 = FakeS3()
+        r = self.sweep(s3)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["uploaded"], 2, r)
+        keys = self.code_keys(s3)
+        self.assertTrue(any(k.endswith("/report.pdf") for k in keys), keys)
+        self.assertTrue(any(k.endswith("/docs/Upper.PDF") for k in keys), keys)
+        body = [v for (_, k), v in s3.objs.items() if k.endswith("/report.pdf")]
+        self.assertEqual(len(body), 1)
+
+    def test_pdf_in_data_dir_is_left_to_the_data_sweep(self):
+        self.w("outputs/a.pdf", b"%PDF-1.4")
+        self.w("notes/b.pdf", b"%PDF-1.4")
+        r = self.sweep(FakeS3(), data_dir=self.d / "outputs")
+        self.assertEqual([f["file"] for f in r["files"] if f["action"] == "uploaded"] or ["notes/b.pdf"], ["notes/b.pdf"])
+        self.assertEqual(r["uploaded"], 1, r)
+
 
     def test_knowledge_and_notebooks_are_included(self):
         self.w("knowledge/_index.md", "k")
@@ -1011,7 +1106,7 @@ class CodeSweep(unittest.TestCase):
         r = self.sweep(FakeS3(), data_dir=self.d / "outputs")
         self.assertEqual(sorted(f["file"] for f in r["files"]), ["outputs/report.py", "settings.json"])
 
-    def test_unchanged_files_are_not_uploaded_again_changed_ones_go_in_a_new_run(self):
+    def test_unchanged_files_are_not_uploaded_again_changed_ones_update_the_same_day_folder(self):
         self.w("a.py", "1")
         self.w("b.py", "2")
         s3 = FakeS3()
@@ -1024,9 +1119,9 @@ class CodeSweep(unittest.TestCase):
         self.w("b.py", "22")
         r3 = self.sweep(s3)
         self.assertEqual((r3["uploaded"], r3["unchanged"]), (1, 1))
-        self.assertNotEqual(r3["run_id"], r1["run_id"])
-        self.assertEqual(len(s3.objs), n + 2)  # one new file + one manifest; nothing overwritten
-        self.assertTrue(any(k.endswith(f"{r1['run_id']}/b.py") for (_, k) in s3.objs))
+        self.assertEqual(r3["run_id"], r1["run_id"])  # same day -> same folder
+        self.assertEqual(len(s3.objs), n)  # b.py and the manifest are updated in place: no extra folder or files
+        self.assertEqual(s3.objs[("rec", f"6_Recovery/tester/Code Panel/code/{r1['run_id']}/b.py")]["data"], b"22")
 
     def test_state_lives_in_dot_fathom_recovery_and_not_in_outputs(self):
         (self.d / "outputs").mkdir()
@@ -1057,7 +1152,7 @@ class CodeSweep(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertEqual((r["uploaded"], r["failed"]), (1, 1))
         state = __import__("json").loads((self.d / ".fathom_recovery" / "code_state.json").read_text())
-        self.assertEqual(list(state), ["good.py"])
+        self.assertEqual([k for k in state if k != fr.CODE_DAY_KEY], ["good.py"])
         r2 = self.sweep(FakeS3())  # fresh bucket + same state: only bad.py is still pending
         self.assertEqual((r2["uploaded"], r2["unchanged"]), (1, 1))
 
@@ -1170,6 +1265,17 @@ class CodeSweep(unittest.TestCase):
         self.assertEqual((r["ok"], r["scanned"], r["uploaded"]), (True, 0, 0))
         self.assertNotIn("run_id", r)
 
+    def test_old_state_without_a_day_marker_triggers_one_full_snapshot(self):
+        # state written by v1.7.1 has no day marker; the first v1.7.2 sweep of the day must upload everything
+        self.w("a.py", "1")
+        self.w("sub/b.py", "2")
+        state_dir = self.d / ".fathom_recovery"
+        state_dir.mkdir()
+        (state_dir / "code_state.json").write_text(__import__("json").dumps(
+            {"a.py": hashlib.sha256(b"1").hexdigest(), "sub/b.py": hashlib.sha256(b"2").hexdigest()}))
+        r = self.sweep(FakeS3())
+        self.assertEqual((r["uploaded"], r["unchanged"]), (2, 0))
+
 
 class CodeRestore(unittest.TestCase):
     def setUp(self):
@@ -1194,12 +1300,17 @@ class CodeRestore(unittest.TestCase):
         return fr.restore_code("R Panel", self.out, destination_bucket="rec", s3=self.s3, **kw)
 
     def two_runs(self):
+        """Two backups on two different days (the code backup keeps one folder per day)."""
+        real = fr.make_day_folder
+        self.addCleanup(setattr, fr, "make_day_folder", real)
+        fr.make_day_folder = lambda now=None: "2026-01-01"
         self.w("a.py", "a1")
         self.w("knowledge/k.md", "k1")
         r1 = self.sweep()
+        fr.make_day_folder = lambda now=None: "2026-01-02"
         self.w("a.py", "a2")
         self.w("new/n.py", "n1")
-        r2 = self.sweep()
+        r2 = self.sweep()  # a new day starts with a full snapshot
         return r1["run_id"], r2["run_id"]
 
     def test_latest_restores_newest_version_of_every_file_with_folders(self):
@@ -1211,18 +1322,29 @@ class CodeRestore(unittest.TestCase):
         self.assertEqual((self.out / "knowledge" / "k.md").read_text(), "k1")
         self.assertEqual((self.out / "new" / "n.py").read_text(), "n1")
 
-    def test_latest_is_right_even_when_two_runs_share_the_same_second(self):
-        # same second, and the OLDER run has the larger random hex: run id order would pick the wrong one
-        ids = iter(["20260101T000000Z-ffffffff", "20260101T000000Z-00000000"])
-        real = fr.make_run_folder
-        fr.make_run_folder = lambda now=None: next(ids)
-        self.addCleanup(setattr, fr, "make_run_folder", real)
+    def test_latest_is_right_when_a_file_changes_twice_on_the_same_day(self):
         self.w("a.py", "old")
         self.sweep()
         self.w("a.py", "new")
-        self.sweep()
+        r = self.sweep()
         self.restore()
         self.assertEqual((self.out / "a.py").read_text(), "new")
+        self.assertEqual(len(fr.summarize_code_runs(fr.list_code("R Panel", destination_bucket="rec", s3=self.s3))), 1)
+        self.assertEqual(r["run_id"], fr.make_day_folder())
+
+    def test_old_timestamp_runs_and_new_day_folders_restore_together(self):
+        # a panel that already has v1.7.1 '<timestamp>-<hex>' runs keeps working after the switch to day folders
+        self.s3.seed("rec", "6_Recovery/tester/R Panel/code/20251231T120000Z-abcdef12/a.py", b"legacy",
+                     meta={"sha256": hashlib.sha256(b"legacy").hexdigest()})
+        self.s3.seed("rec", "6_Recovery/tester/R Panel/code/20251231T120000Z-abcdef12/old_only.py", b"o",
+                     meta={"sha256": hashlib.sha256(b"o").hexdigest()})
+        self.w("a.py", "fresh")
+        self.sweep()
+        runs = fr.summarize_code_runs(fr.list_code("R Panel", destination_bucket="rec", s3=self.s3))
+        self.assertEqual([r["run_id"] for r in runs], [fr.make_day_folder(), "20251231T120000Z-abcdef12"])
+        self.restore()
+        self.assertEqual((self.out / "a.py").read_text(), "fresh")
+        self.assertEqual((self.out / "old_only.py").read_text(), "o")
 
     def test_latest_still_works_if_a_manifest_is_missing(self):
         self.two_runs()
@@ -1351,11 +1473,11 @@ class CodeCli(unittest.TestCase):
         self.assertIn("code-sweep --config recovery_config.json --apply", ins)
         self.assertIn("knowledge/", ins)
         self.assertIn("run BOTH commands", ins)
-        self.assertIn("/code/<timestamp>", ins)
+        self.assertIn("/code/<YYYY-MM-DD>/", ins)
         self.assertIn("sweep --config recovery_config.json --apply", ins)  # data rule is still there
 
     def test_markers(self):
-        self.assertEqual(fr.__version__, "1.7.1")
+        self.assertEqual(fr.__version__, "1.7.2")
         self.assertEqual(fr.LAYOUT, "user/panel")
         self.assertEqual(fr.CODE_BACKUP, "1")
 

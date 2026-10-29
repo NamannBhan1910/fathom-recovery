@@ -73,14 +73,14 @@ python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --ap
 python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
 ```
 
-### Fastest setup for a new panel (v1.7.1)
+### Fastest setup for a new panel (v1.7.2)
 
 Run these in the panel's workspace root (in Fathom, ask the panel's agent to run them). The clone goes
 into a folder named after the version, so running the lines again never fails with "already exists":
 
 ```
-[ -d fathom-recovery-v1.7.1 ] || git clone --depth 1 --branch v1.7.1 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.7.1
-python3 fathom-recovery-v1.7.1/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.7.2 ] || git clone --depth 1 --branch v1.7.2 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.7.2
+python3 fathom-recovery-v1.7.2/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone, writes `recovery_config.json` and
@@ -132,15 +132,15 @@ separate job that backs up everything else the panel is made of: Python, noteboo
 YAML/TOML/INI/JSON config, and the whole `knowledge/` folder.
 
 ```
-s3://<bucket>/6_Recovery/<user>/<Panel Name>/code/<YYYYMMDDTHHMMSSZ>-<8 hex>/<relative/path/file>
+s3://<bucket>/6_Recovery/<user>/<Panel Name>/code/<YYYY-MM-DD>/<relative/path/file>
 ```
 
 | Question | Answer |
 |---|---|
 | What is scanned? | The whole workspace (the folder that holds `recovery_config.json`), recursively. |
-| Which files? | `py ipynb md markdown json js jsx ts tsx html htm css sql yaml yml toml ini cfg conf sh r txt`, `Dockerfile`, `Makefile`. Override with `code_patterns` in the config or `--pattern`. |
-| Folder paths | Kept. `scripts/setup_panel.py` and `fathom-recovery/setup_panel.py` are two different objects. |
-| One run folder | Each sweep that finds changes makes ONE new run folder holding only the new/changed files, plus a hidden `.fathom_manifest.json` (path, sha256, size per file). Nothing is overwritten, so every version is kept. |
+| Which files? | `py ipynb md markdown json js jsx ts tsx html htm css sql yaml yml toml ini cfg conf sh r txt pdf`, `Dockerfile`, `Makefile`. Override with `code_patterns` in the config or `--pattern`. |
+| Folder paths | Kept. A file in `scripts/` lands in `code/<date>/scripts/`, a file in `a/b/` lands in `code/<date>/a/b/`. `scripts/setup_panel.py` and `fathom-recovery/setup_panel.py` are two different objects. The same applies to the data sweep: `outputs/reports/q1.csv` lands in `<run>/reports/q1.csv`. |
+| One folder per day | All code sweeps on one UTC day write into ONE folder, `code/<YYYY-MM-DD>/`, with a hidden `.fathom_manifest.json` (path, sha256, size per file, merged across the day). The first sweep of a day uploads every file (a full snapshot); later sweeps that day add only files that changed and overwrite that day's copy. Each day is kept, so you get one version per day. Older `<timestamp>-<8 hex>` runs from v1.7.1 stay readable and restorable. |
 | What is skipped? | Hidden files/folders (`.git`, `.fathom_runtime`, `.fathom_recovery`, `.workspace_meta.json`), `__pycache__`, `node_modules`, `venv`, `site-packages`, symlinks, files over 10 MB (`--max-mb`), and the **data files inside `output_dir`** (the normal `sweep` owns those). Code files inside `outputs/` (for example `outputs/report.py`) are backed up. |
 | Secrets | A config-like file (`json yaml yml toml ini cfg conf txt`) whose name contains `secret`, `credential`, `password`, `token`, `api_key`, `private_key`, `service_account` or `id_rsa` is **not uploaded**. It is listed as `skipped_sensitive_name` so nothing is hidden silently. Code files (`tokenizer.py`) are never judged by name. File contents are not inspected, so do not keep secrets inside code or notes. |
 | State | `.fathom_recovery/code_state.json` (path -> sha256), outside `outputs/`. A file is recorded only after its upload verified (size, `sha256` metadata, content read back), so failures are retried next time. |
@@ -222,7 +222,7 @@ Spelling matters except for case and extra spaces. Add a row before a panel star
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.7.1 --dest scripts --run-tests --panel-name "<Panel>"
+python3 sync_recovery.py --repo <git url> --ref v1.7.2 --dest scripts --run-tests --panel-name "<Panel>"
 ```
 (`sync_recovery.py` itself can be run again and again; only a plain `git clone` into an existing folder
 fails, so clone into a new or versioned folder name.)

@@ -51,8 +51,9 @@ Code / knowledge backup (v1.7.0)
 
 `code-sweep` scans the WHOLE workspace (py, ipynb, md, json, js, html, sql, yaml, ... including
 knowledge/) and uploads new/changed files to
-    <prefix><user>/<Panel>/code/<YYYYMMDDTHHMMSSZ>-<8 hex>/<relative/path/file>
-with the folder structure kept, plus a `_manifest.json` per run. One run folder per sweep. State is
+    <prefix><user>/<Panel>/code/<YYYY-MM-DD>/<relative/path/file>
+with the workspace folder structure kept, plus a `.fathom_manifest.json`. ONE folder per UTC day: every
+sweep that day writes into it (a file changed twice in one day overwrites that day's copy). State is
 kept in .fathom_recovery/code_state.json. Hidden files/folders (.git, .fathom_runtime, ...), __pycache__,
 node_modules and files over 10 MB are skipped; data files that the normal `sweep` already backs up
 from outputs/ are not uploaded twice. It only reads files; nothing local or in S3 is ever deleted.
@@ -79,7 +80,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 LAYOUT = "user/panel"  # marker: <prefix>/<user>/<panel>/<run>/<file>. Panels grep for this line.
 CODE_BACKUP = "1"  # marker: this script has code-sweep / restore-code. Panels grep for this line.
 REPO_URL = "https://github.com/NamannBhan1910/fathom-recovery.git"
@@ -142,14 +143,28 @@ def make_run_folder(now: datetime | None = None) -> str:
     return f"{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(4)}"
 
 
+def make_day_folder(now: datetime | None = None) -> str:
+    """'<YYYY-MM-DD>' (UTC), e.g. 2026-10-27. One folder per day for the code backup."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return now.strftime("%Y-%m-%d")
+
+
 def build_destination_key(
     source_key: str,
     panel_name: str,
     user: str | None = None,
     destination_prefix: str = DESTINATION_PREFIX,
     now: datetime | None = None,
+    keep_path: bool = False,
 ) -> str:
-    filename = posixpath.basename(source_key or "")
+    """keep_path=False stores only the file name; keep_path=True keeps the folder path inside the file name."""
+    if keep_path:
+        segs = (source_key or "").replace("\\", "/").split("/")
+        if any(s in {"", ".", ".."} for s in segs):
+            raise ValueError("relative path must have no empty, '.' or '..' parts")
+        filename = "/".join(segs)
+    else:
+        filename = posixpath.basename(source_key or "")
     if not filename:
         raise ValueError("source_key must include a filename")
     panel = _safe_segment(panel_name, "panel_name")
@@ -422,8 +437,12 @@ def upload_to_recovery(
     destination_prefix: str = DESTINATION_PREFIX,
     s3: Any | None = None,
     match_existing_folder: bool = True,
+    relative_path: str | None = None,
 ) -> dict[str, Any]:
     """Store data directly in the panel's recovery folder (no source object needed).
+
+    relative_path  keeps the file's workspace folder path: 'sub/a.csv' lands in <run>/sub/a.csv
+                   instead of <run>/a.csv.
 
     The panel name is matched to an existing folder ignoring case and extra spaces (see
     resolve_panel_folder). match_existing_folder=False skips that lookup (sweep resolves once).
@@ -459,7 +478,8 @@ def upload_to_recovery(
         client = s3 or boto3.client("s3")
         panel_folder, panel_warning, user_folder = _panel_folder(
             panel_name, client, destination_bucket, destination_prefix, user)
-    key = build_destination_key(name, panel_folder, user_folder, destination_prefix)
+    key = build_destination_key(relative_path or name, panel_folder, user_folder, destination_prefix,
+                                keep_path=bool(relative_path))
     rel = key[len(_clean_prefix(destination_prefix)):]
     sha = hashlib.sha256(body).hexdigest()
     base = {"filename": name, "recovery_path": rel, "size_bytes": len(body), "sha256": sha,
@@ -719,7 +739,7 @@ def selfcheck(
 
 # ------------------------------------------------------------------- sweep
 SWEEP_STATE_NAME = ".fathom_recovery_state.json"
-SWEEP_DEFAULT_PATTERNS = ("*.csv", "*.xlsx", "*.xls", "*.json", "*.parquet", "*.txt")
+SWEEP_DEFAULT_PATTERNS = ("*.csv", "*.xlsx", "*.xls", "*.json", "*.parquet", "*.txt", "*.pdf")
 _SWEEP_SKIP_DIRS = {".git", ".fathom_runtime", "__pycache__", "knowledge", "node_modules", ".venv", "tests"}
 
 
@@ -779,7 +799,8 @@ def sweep(
         rel_parts = p.relative_to(root).parts
         if any(part in _SWEEP_SKIP_DIRS for part in rel_parts[:-1]):
             continue
-        if not any(fnmatch.fnmatch(p.name, pat) for pat in pats):
+        low_name = p.name.lower()  # case-insensitive: REPORT.PDF matches *.pdf on Linux too
+        if not any(fnmatch.fnmatchcase(low_name, pat.lower()) for pat in pats):
             continue
         counts["scanned"] += 1
         rel = "/".join(rel_parts)
@@ -807,7 +828,7 @@ def sweep(
             res = upload_to_recovery(
                 data, p.name, panel_name=panel_folder, user=user_folder, s3=client,
                 destination_bucket=destination_bucket, destination_prefix=destination_prefix,
-                match_existing_folder=False,
+                match_existing_folder=False, relative_path=rel,
             )
         except Exception as exc:  # noqa: BLE001 - one bad file must not stop the sweep
             counts["failed"] += 1
@@ -829,17 +850,19 @@ def sweep(
 # ------------------------------------------------- code + knowledge backup (v1.7.0)
 # Separate from `sweep` (which backs up data files in outputs/ and is unchanged). The code sweep walks
 # the WHOLE workspace and keeps folder paths:
-#     <prefix><user>/<Panel>/code/<YYYYMMDDTHHMMSSZ>-<8 hex>/<relative/path/file>
-# One run folder per sweep holds only the files that are new/changed in that sweep, plus a manifest.
+#     <prefix><user>/<Panel>/code/<YYYY-MM-DD>/<relative/path/file>   (v1.7.1 and older: <timestamp>-<8 hex> runs)
+# (v1.7.2) ONE folder per UTC day: all sweeps that day write into <YYYY-MM-DD>/ (only new/changed files),
+# plus a manifest that is merged across the day's sweeps.
 CODE_STATE_DIR = ".fathom_recovery"
 CODE_STATE_NAME = "code_state.json"
 CODE_FOLDER = "code"
+CODE_DAY_KEY = ".fathom_day"  # state entry: the UTC day the hashes belong to (hidden name: never a real file)
 CODE_MANIFEST_NAME = ".fathom_manifest.json"  # hidden name: can never collide with a swept workspace file
 CODE_MAX_BYTES = 10 * 1024 * 1024
 CODE_DEFAULT_PATTERNS = (
     "*.py", "*.ipynb", "*.md", "*.markdown", "*.json", "*.js", "*.jsx", "*.ts", "*.tsx", "*.html", "*.htm",
     "*.css", "*.sql", "*.yaml", "*.yml", "*.toml", "*.ini", "*.cfg", "*.conf", "*.sh", "*.r", "*.txt",
-    "dockerfile", "makefile",
+    "*.pdf", "dockerfile", "makefile",
 )
 _CODE_SKIP_DIRS = {"__pycache__", "node_modules", "venv", "site-packages"}
 # Config-like files whose NAME suggests secrets are not uploaded (they are reported, so nothing is hidden).
@@ -893,7 +916,10 @@ def code_sweep(
 ) -> dict[str, Any]:
     """Back up the panel's code, notebooks, docs and knowledge/ files (new or changed since the last run).
 
-    Scans `directory` (the whole workspace) and uploads to <prefix><user>/<panel>/code/<run>/<relative path>.
+    Scans `directory` (the whole workspace) and uploads to <prefix><user>/<panel>/code/<YYYY-MM-DD>/<relative path>.
+    ONE folder per UTC day: the first sweep of a day uploads every file (a full snapshot of that day), later
+    sweeps the same day only add files that changed since, overwriting that day's copy. The workspace folder
+    structure is kept inside the day folder.
     Skipped: hidden files/folders (.git, .fathom_runtime, .fathom_recovery, ...), __pycache__, node_modules,
     venv, site-packages, symlinks, files over `max_bytes`, config-like files whose name looks secret
     (reported, not uploaded), and the data files under `data_dir` that the normal `sweep` already covers.
@@ -907,6 +933,11 @@ def code_sweep(
         raise ValueError("directory does not exist")
     state_file = Path(state_path).resolve() if state_path else root / CODE_STATE_DIR / CODE_STATE_NAME
     state = _load_state(state_file)
+    today = make_day_folder()
+    if state.get(CODE_DAY_KEY) != today:
+        # a new day: today's folder starts empty, so every file is uploaded once into it (a full snapshot).
+        # Dropping yesterday's hashes also means a file that fails today is retried, not skipped.
+        state = {}
     pats = [p.lower() for p in (patterns or CODE_DEFAULT_PATTERNS)]
     dpats = [p.lower() for p in (data_patterns or SWEEP_DEFAULT_PATTERNS)]
     data_root = Path(data_dir).resolve() if data_dir else None
@@ -957,7 +988,7 @@ def code_sweep(
             if not resolved:
                 panel_folder, warning, user_folder = _panel_folder(
                     panel_name, client, destination_bucket, destination_prefix, user)
-                run_id = make_run_folder()
+                run_id = today  # ONE folder per (UTC) day: same-day re-runs reuse it
                 resolved = True
             key = f"{_clean_prefix(destination_prefix)}{user_folder}/{panel_folder}/{CODE_FOLDER}/{run_id}/{rel}"
             ok = _put_verified(client, destination_bucket, key, data, sha)
@@ -977,10 +1008,22 @@ def code_sweep(
     result: dict[str, Any] = {"ok": counts["failed"] == 0, "action": "code-sweep", "applied": apply, **counts}
     if apply and uploaded_meta:
         run_prefix = f"{_clean_prefix(destination_prefix)}{user_folder}/{panel_folder}/{CODE_FOLDER}/{run_id}/"
+        # the day folder can already hold a manifest from an earlier run today: merge, never drop its entries
+        merged: dict[str, dict[str, Any]] = {}
+        try:
+            old = json.loads(client.get_object(
+                Bucket=destination_bucket, Key=run_prefix + CODE_MANIFEST_NAME)["Body"].read())
+            for f in old.get("files", []):
+                if isinstance(f, dict) and isinstance(f.get("path"), str):
+                    merged[f["path"]] = f
+        except Exception:  # noqa: BLE001 - no manifest yet (first run of the day) or unreadable: start fresh
+            pass
+        merged.update({f["path"]: f for f in uploaded_meta})
         manifest = json.dumps({
-            "fathom_recovery_version": __version__, "kind": "code-run", "panel": panel_folder,
+            "fathom_recovery_version": __version__, "kind": "code-day", "panel": panel_folder,
             "user": user_folder, "run_id": run_id,
-            "created_utc": datetime.now(timezone.utc).isoformat(), "files": uploaded_meta,
+            "created_utc": datetime.now(timezone.utc).isoformat(),  # time of the last update that day
+            "files": [merged[k] for k in sorted(merged)],
         }, indent=2, sort_keys=True).encode("utf-8")
         try:
             mok = _put_verified(client, destination_bucket, run_prefix + CODE_MANIFEST_NAME, manifest,
@@ -991,6 +1034,7 @@ def code_sweep(
         result["manifest_ok"] = mok
         if not mok:
             result["ok"] = False  # the files are safe in S3 and recorded in state; restore does not need the manifest
+        state[CODE_DAY_KEY] = today
         state_file.parent.mkdir(parents=True, exist_ok=True)
         _save_state(state_file, state)
     if run_id:
@@ -1030,12 +1074,22 @@ def list_code(
             out.append({"run_id": run_id, "path": path, "size_bytes": obj.get("Size"), "key": key,
                         "recovery_path": key[len(root):], "user": who, "panel": panel,
                         "last_modified_utc": lm.astimezone(timezone.utc).isoformat() if lm else None})
-    out.sort(key=lambda r: (r["run_id"], r["path"]), reverse=True)
+    out.sort(key=lambda r: (_run_sort_key(r["run_id"]), r["path"]), reverse=True)
     return out
 
 
+def _run_sort_key(run_id: str) -> str:
+    """Sortable UTC time for a code folder name: new day folders 'YYYY-MM-DD' and old '<YYYYMMDDTHHMMSSZ>-<hex>' runs."""
+    for fmt, part in (("%Y-%m-%d", run_id), ("%Y%m%dT%H%M%SZ", run_id.split("-")[0])):
+        try:
+            return datetime.strptime(part, fmt).replace(tzinfo=timezone.utc).isoformat() + "|" + run_id
+        except ValueError:
+            continue
+    return "|" + run_id
+
+
 def _run_time(client: Any, bucket: str, run_prefix: str, run_id: str) -> str:
-    """ISO time of a code run: the manifest's created_utc, else the timestamp inside the run id."""
+    """ISO time of a code folder: the manifest's created_utc, else the time/date inside the folder name."""
     try:
         body = client.get_object(Bucket=bucket, Key=run_prefix + CODE_MANIFEST_NAME)["Body"].read()
         created = json.loads(body).get("created_utc")
@@ -1043,21 +1097,18 @@ def _run_time(client: Any, bucket: str, run_prefix: str, run_id: str) -> str:
             return created
     except Exception:  # noqa: BLE001 - a missing/unreadable manifest only weakens the ordering
         pass
-    try:
-        return datetime.strptime(run_id.split("-")[0], "%Y%m%dT%H%M%SZ").replace(
-            tzinfo=timezone.utc).isoformat()
-    except ValueError:
-        return ""
+    return _run_sort_key(run_id).split("|")[0]
 
 
 def summarize_code_runs(objs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group list_code() rows into runs (newest first) with file count and total size."""
+    """Group list_code() rows by code folder (one per day; newest first) with file count and total size."""
     runs: dict[str, dict[str, Any]] = {}
     for o in objs:
         r = runs.setdefault(o["run_id"], {"run_id": o["run_id"], "files": 0, "size_bytes": 0})
         r["files"] += 1
         r["size_bytes"] += o.get("size_bytes") or 0
-    return sorted(runs.values(), key=lambda r: r["run_id"], reverse=True)
+    return sorted(runs.values(), key=lambda r: _run_sort_key(r["run_id"]), reverse=True)
+
 
 
 def restore_code(
@@ -1096,7 +1147,7 @@ def restore_code(
         contested = {o["run_id"]: o["key"][: -len(o["path"])]
                      for rows in by_path.values() if len(rows) > 1 for o in rows}
         when = {rid: _run_time(client, destination_bucket, pfx, rid) for rid, pfx in contested.items()}
-        chosen = sorted((max(rows, key=lambda o: (when.get(o["run_id"], ""), o["run_id"]))
+        chosen = sorted((max(rows, key=lambda o: (when.get(o["run_id"], ""), _run_sort_key(o["run_id"])))
                          for rows in by_path.values()), key=lambda o: o["path"])
     target = Path(target_dir).resolve()
     counts = {"restored": 0, "would_restore": 0, "refused_exists": 0, "failed": 0}
@@ -1203,7 +1254,7 @@ Rule (follow it every time, without being asked):
 5. Never delete anything in S3 and never edit {config_path} yourself unless I ask.
 
 Data files land in S3 under 6_Recovery/<user>/<panel folder>/<timestamp>-<8 hex>/<file>.
-Code and knowledge files land under 6_Recovery/<user>/<panel folder>/code/<timestamp>-<8 hex>/<folder>/<file>.
+Code and knowledge files land under 6_Recovery/<user>/<panel folder>/code/<YYYY-MM-DD>/<folder>/<file> (one folder per day).
 Nothing uploads by itself: these rules are what trigger the upload.
 """
 
@@ -1399,7 +1450,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "explicit --panel-name/--dir/--pattern override it")
     sw.add_argument("--dir", default=None, help="folder to scan (default: output_dir from --config, else .)")
     sw.add_argument("--pattern", action="append", default=None,
-                    help="glob such as *.csv (repeatable; default: csv, xlsx, xls, json, parquet, txt)")
+                    help="glob such as *.csv (repeatable; default: csv, xlsx, xls, json, parquet, txt, pdf)")
     sw.add_argument("--no-recursive", action="store_true")
     sw.add_argument("--state-file", default=None, help="where to remember uploaded files")
     sw.add_argument("--user", default=None)
