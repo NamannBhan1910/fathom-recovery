@@ -1,66 +1,90 @@
-"""Paste-in block for a panel's generation code (fathom_recovery >= 1.2.0).
+"""Paste-in block for a panel's generation code (fathom_recovery v1.9.x).
 
-Set PANEL_NAME to the exact name the user gave (case and spaces matter).
-Files land in:  6_Recovery/<user>/<PANEL_NAME>/<timestamp>-<8 hex>/<filename>
+v1.9.x is a command-line tool: it has no importable upload functions (that API belonged to v1.7.x and older).
+This snippet runs the installed CLI for you and returns what it printed, so a panel's generation code can
+back up what it just wrote without knowing any S3 details.
 
-Two ways to use it (neither runs by itself; the panel's code must call one):
-  push(data, filename)  - upload ONE file right when it is created
-  sweep_now(folder)     - upload every NEW or CHANGED file in a folder; call it once at the
-                          end of the generation step, after the files are fully written
+Layout in S3:   6_Recovery/<user>/<Panel>/
+                    <YYYYMMDD>_current_data/<path inside outputs/>   data files, one folder per UTC day
+                    code/<path>                                       whole workspace, ONE live copy
 
-`fathom_recovery.py` is looked up next to this file first, then in a `scripts/` folder next to
-it (where sync_recovery.py installs it by default).
+Nothing here runs by itself; the panel's code (or its agent) has to call one of:
+  sweep_now()       data files of outputs/  -> today's <YYYYMMDD>_current_data/   (call after the files are written)
+  code_sweep_now()  whole workspace         -> code/                              (call after code/knowledge changed)
+
+Both only upload NEW or CHANGED files, so calling them after every run is safe.
+The panel name, output folder and state files come from recovery_config.json (written by setup_panel.py or
+`fathom_recovery.py setup`), so there is nothing to configure in this file.
 """
 import os
+import re
+import subprocess
 import sys
-from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (_HERE, os.path.join(_HERE, "scripts")):
-    if os.path.isfile(os.path.join(_p, "fathom_recovery.py")) and _p not in sys.path:
-        sys.path.insert(0, _p)
-from fathom_recovery import copy_created_object_to_recovery, upload_to_recovery
-
-PANEL_NAME = "<Panel Name given by the user>"
+CONFIG_NAME = "recovery_config.json"
+_SUMMARY = re.compile(r"SUMMARY uploaded=(\d+) unchanged=(\d+) failed=(\d+)"
+                      r"(?: skipped_sensitive=(\d+) skipped_large=(\d+))?")
 
 
-def push(data, filename=None, content_type=None) -> dict:
-    """data = bytes | str (content) | pathlib.Path (local file). Raises on failure, warns if unverified."""
-    try:
-        res = upload_to_recovery(data, filename, panel_name=PANEL_NAME, content_type=content_type)
-    except Exception as exc:  # noqa: BLE001 - report, don't hide
-        print(f"RECOVERY FAILED for {filename or data}: {type(exc).__name__}: {exc}")
-        raise
+def _root() -> str:
+    """Workspace root = the folder that holds recovery_config.json (env FATHOM_PANEL_ROOT, cwd, then next to this file)."""
+    for cand in (os.environ.get("FATHOM_PANEL_ROOT"), os.getcwd(), _HERE, os.path.dirname(_HERE)):
+        if cand and os.path.isfile(os.path.join(cand, CONFIG_NAME)):
+            return cand
+    raise FileNotFoundError(f"{CONFIG_NAME} not found (looked in the cwd and next to this file); "
+                            "run setup_panel.py or `fathom_recovery.py setup --panel-name ...` first")
+
+
+def _script(root: str) -> str:
+    for cand in (os.path.join(root, "scripts", "fathom_recovery.py"), os.path.join(root, "fathom_recovery.py"),
+                 os.path.join(_HERE, "fathom_recovery.py")):
+        if os.path.isfile(cand):
+            return cand
+    raise FileNotFoundError("fathom_recovery.py not found (expected scripts/fathom_recovery.py)")
+
+
+def _run(command: str, state_name: str, timeout: int = 900) -> dict:
+    root = _root()
+    os.makedirs(os.path.join(root, ".fathom_recovery"), exist_ok=True)
+    cmd = [sys.executable, "-B", _script(root), command, "--config", CONFIG_NAME,
+           "--state-file", os.path.join(".fathom_recovery", state_name), "--apply"]
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    r = subprocess.run(cmd, cwd=root, env=env, capture_output=True, text=True, timeout=timeout)
+    out = (r.stdout + r.stderr).strip()
+    m = _SUMMARY.search(out)
+    res = {
+        "command": command,
+        "exit_code": r.returncode,                       # 0 ok, 1 some file failed, 2 STOP (credentials / AccessDenied / bucket)
+        "uploaded": int(m.group(1)) if m else None,
+        "unchanged": int(m.group(2)) if m else None,
+        "failed": int(m.group(3)) if m else None,
+        "skipped_sensitive": int(m.group(4)) if m and m.group(4) is not None else None,
+        "skipped_large": int(m.group(5)) if m and m.group(5) is not None else None,
+        "output": out,
+    }
+    res["ok"] = r.returncode == 0 and m is not None and res["failed"] == 0
+    return res
+
+
+def _report(res: dict) -> dict:
     if res["ok"]:
-        print(f"Recovery upload OK: {res['recovery_path']}")
+        print(f"Recovery {res['command']}: uploaded={res['uploaded']} unchanged={res['unchanged']} failed=0")
     else:
-        print(f"RECOVERY WARNING for {res['filename']}: upload not verified: {res}")
+        print(f"RECOVERY {res['command'].upper()} PROBLEM (exit {res['exit_code']}):\n{res['output'][-1500:]}")
     return res
 
 
-def sweep_now(directory: str = ".", patterns=None) -> dict:
-    """Upload every NEW or CHANGED file under `directory` (no per-file calls needed).
-
-    Call this once at the end of the panel's generation code. Files already uploaded and
-    unchanged are skipped, so it is safe to call after every run.
-    `patterns` defaults to the same list as the `sweep` command (csv, xlsx, xls, json, parquet, txt, pdf).
-    """
-    from fathom_recovery import SWEEP_DEFAULT_PATTERNS, sweep
-
-    res = sweep(directory, PANEL_NAME, patterns=patterns or SWEEP_DEFAULT_PATTERNS, apply=True)
-    print(f"Recovery sweep: uploaded={res['uploaded']} unchanged={res['unchanged']} failed={res['failed']}")
-    for f in res["files"]:
-        if f["action"] == "failed":
-            print(f"RECOVERY FAILED for {f['file']}: {f.get('error')}")
-    return res
+def sweep_now() -> dict:
+    """Upload every NEW or CHANGED data file of outputs/ into today's <YYYYMMDD>_current_data/ folder."""
+    return _report(_run("sweep", "state.json"))
 
 
-def backup_existing(bucket: str, key: str) -> dict:
-    """Recovery copy of an object another step already created in S3."""
-    return copy_created_object_to_recovery(bucket, key, panel_name=PANEL_NAME)
+def code_sweep_now() -> dict:
+    """Upload every NEW or CHANGED file of the whole workspace (code, knowledge/, hidden files) into code/."""
+    return _report(_run("code-sweep", "code_state.json"))
 
 
-# Examples:
-#   push(csv_bytes, "report.csv")
-#   push(Path("report.csv"))
-#   sweep_now("outputs")
+# Examples (put them LAST in the generation code, after the files are fully written):
+#   sweep_now()
+#   code_sweep_now()

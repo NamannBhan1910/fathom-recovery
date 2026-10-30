@@ -1,238 +1,170 @@
-# fathom-recovery
+# fathom-recovery (v1.9.2)
 
-One small, dependency-light module that gives **any Fathom panel** a recovery copy of the
-files it generates. Panels live in different conversations/projects, so the repo is designed
-to be copied into (or pulled into) each one without any panel-specific code.
+One single-file, command-line tool (`fathom_recovery.py`, needs only `boto3`) that gives **any Fathom panel** a
+recovery copy in S3. It is storage only: it copies files and **never deletes anything**, locally or in S3.
+
+> **v1.9.x is a CLI, not a library.** The importable Python functions of v1.7.x and older, and its `upload`, `copy`
+> and `init` commands, no longer exist. Use the commands below, or `panel_snippet.py` to run them from Python.
+> A panel still on v1.7.x keeps working with its own tag; do not mix files from different tags.
 
 ## Where files go
 
 ```
-s3://mosaic-derivatives-margining/6_Recovery/<user>/<Panel Name>/<YYYYMMDDTHHMMSSZ>-<8 hex>/<filename>
+s3://<bucket>/6_Recovery/<user>/<Panel>/
+    code/<relative path>                      whole workspace, ONE live copy (no date folder)
+    <YYYYMMDD>_current_data/<relative path>   data files of outputs/, one folder per UTC day, beside code/
+    <old folders>                             older layouts, never touched
 ```
 
-| Part | Source |
+| Part | Rule |
 |---|---|
-| `<Panel Name>` | **Required.** Lives inside the user's own folder. Given by the user at execution. Matched to an existing folder ignoring case and extra spaces (`daily checklist equities` uses `Daily Checklist Equities`). A name that matches no folder creates one, with the spelling given. If two existing folders differ only by case, the call fails and the exact spelling must be used. |
-| `<user>` | First level. `--user` / `user=` > `RECOVERY_USER` env > `bridge.whoami()` > `unknown-user`. Every user gets their own folder, and panel names are matched only inside it. |
-| `<timestamp>-<8 hex>` | UTC time of the copy + random suffix. Unique per copy, so **nothing is overwritten**; every version is kept. |
+| `<user>` | `--user`, else env `RECOVERY_USER`, else `bridge.whoami()` (username, else the part of the email before `@`), else `unknown-user`. |
+| `<Panel>` | `panel_name` from `recovery_config.json`. Rejected if empty, `.`, `..`, or containing `<` or `>`. |
+| Folder matching | Ignores case and extra spaces, the same rule for user and panel. The exact spelling wins; one case-insensitive match uses that spelling; several matches and none exact fail ("the exact spelling is needed"); none creates the folder with the given spelling. If listing is not permitted, the given spelling is used with a warning. |
+| Bucket / prefix | Defaults `mosaic-derivatives-margining` / `6_Recovery`, overridable with `RECOVERY_DESTINATION_BUCKET` / `RECOVERY_DESTINATION_PREFIX`. The bucket name is never printed. |
 
-Each recovery object carries `sha256` metadata of the source bytes. The helper checks the copied size
-against the source and reports `ok: false` on mismatch. Panel names are sanitised (slashes can't
-create extra folders; blank, `.` and `..` are rejected) **before** any write.
+### One folder per UTC day (data)
 
-Bucket/prefix defaults can be overridden with `RECOVERY_DESTINATION_BUCKET` / `RECOVERY_DESTINATION_PREFIX`.
+`<YYYYMMDD>_current_data/` is the **only** per-day folder this tool creates. It holds the setup probe
+`selfcheck_probe.txt`, the data files and `.fathom_manifest.json`. The tool never creates a timestamp run folder.
 
-## Layout change in v1.6.0: user first, then panel (v1.6.1: user folder matched ignoring case, LAYOUT marker)
+- **At setup** today's folder is created (probe plus any data already in `outputs/`).
+- **Later the same day** new or changed files go into the SAME folder; a file changed again overwrites that day's copy.
+- **On a new UTC day** the first sweep that has new or changed data creates the next `<YYYYMMDD>_current_data/`.
+  Yesterday's folder is never modified. A sweep with nothing new creates nothing.
+- UTC midnight is 8:00 PM EDT (7:00 PM EST), so an evening run can already land in the next day's folder.
 
-Before v1.6.0 files went to `6_Recovery/<Panel>/<user>/...`. From v1.6.0 they go to
-`6_Recovery/<user>/<Panel>/...`, so each user has one folder holding all of their panels.
+## Setup (once per panel)
 
-- The user folder is matched ignoring case (`nbhan` -> existing `NBHAN`), then panel names are matched (case
-  and extra spaces ignored) only inside that user's folder, so two users can have panels with the same name
-  without sharing a folder.
-- `list` shows the current user's panel by default; `--user <name>` looks at another user's.
-- Nothing already in S3 was moved or renamed. Objects written before v1.6.0 stay under the old path and
-  can be found with `list --legacy` and restored with their `recovery_path` as before.
+```
+[ -d fathom-recovery-v1.9.2 ] || git clone --depth 1 --branch v1.9.2 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.9.2
+python3 fathom-recovery-v1.9.2/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+```
+
+`setup_panel.py` installs `scripts/fathom_recovery.py` from that clone and runs its `setup` command, which writes
+`recovery_config.json` if missing (an existing one is kept), creates `outputs/` if missing, runs `selfcheck`, then the
+first data `sweep` and the first `code-sweep`. Without `--apply` it is a dry run and writes nothing to S3.
+Or, with the script already installed:
+
+```
+python3 scripts/fathom_recovery.py setup --panel-name "<Panel>" --output-dir outputs --apply
+```
+
+A FAIL mentioning `AccessDenied`, `NoCredentialsError` or `NoSuchBucket` means that panel's runtime has no S3 permission
+on `6_Recovery/`; the tool prints `STOP: ...` and exits with code 2.
+
+## Commands
+
+All are dry runs unless `--apply` is given. `--panel-name` can replace `--config` on `selfcheck`, `list`, `list-code`.
+
+| Command | What it does |
+|---|---|
+| `setup --panel-name N --output-dir D` | Config if missing, creates `D` if missing, `selfcheck`, first `sweep`, first `code-sweep`. |
+| `sweep --config C --state-file .fathom_recovery/state.json` | Data files (csv xlsx xls json parquet txt pdf, any case) of `outputs/`, sub-folders kept, to today's `<YYYYMMDD>_current_data/`. Only new or changed files. Last lines: `data_folder=...`, `SUMMARY uploaded=X unchanged=Y failed=Z`. |
+| `code-sweep --config C --state-file .fathom_recovery/code_state.json` | Whole workspace to `code/<path>` (see below). Last lines: `uploaded_by_folder`, `knowledge_dir_present=... scripts_dir_present=...`, `SUMMARY uploaded=X unchanged=Y failed=Z skipped_sensitive=S skipped_large=L`. |
+| `selfcheck --config C [--apply]` | Read-only checks; with `--apply` writes and verifies one `selfcheck_probe.txt` in today's `<YYYYMMDD>_current_data/` (re-running the same day overwrites that one probe; it is not listed in the sweep manifest). |
+| `list --config C [--user U] [--legacy]` | Every folder beside `code/` (the `<YYYYMMDD>_current_data` folders and old timestamp runs), newest first. `--legacy` lists the old `<prefix>/<Panel>/<user>/<run>/<file>` layout. |
+| `list-code --config C [--user U] [--run R]` | No `--run`: the live `code/` copy plus any old day or timestamp folders inside `code/`. `--run live`: the live entries, then `S3_FILE_COUNT` and `MANIFEST_FILE_COUNT` (they should match). `--run <folder>`: that old folder. |
+| `verify-code --config C [--user U]` | Read-only. Re-downloads every live `code/` object, hashes it and compares with the local file. Prints `OK` / `MISMATCH` / `MISSING_IN_S3` / `S3_ONLY` per entry, then `SUMMARY verified_ok=... mismatch=... missing_in_s3=... s3_only=...`; exit 1 on any mismatch or missing file. |
+| `restore-code --config C [--run R] [--target-dir D] [--overwrite]` | Writes only into a NEW folder (default `restored_code/`). No `--run`: the live copy wins and files that exist only in old folders are added from the newest old folder that has them. `--run live`: live only. `--run <folder>`: exactly that folder. Empty-folder markers are recreated, hidden and empty files restored, every sha256 re-checked, existing files refused without `--overwrite`, keys with `..` rejected. Never touches live panel files. |
+| `restore --recovery-path "<user>/<Panel>/<folder>/<file>" --target-bucket B --target-key K [--overwrite]` | Copies one recovery object to your target key; refuses an existing target without `--overwrite`; verifies sha256. |
+
+### Whole-workspace backup (`code-sweep`)
+
+`code-sweep` walks the workspace root (the folder holding `recovery_config.json`) and uploads **every** file and every
+empty folder, including `knowledge/`, hidden files and folders, the platform's `.fathom_runtime/` and
+`.workspace_meta.json`, the tool's own `.fathom_recovery/` state files and empty files.
+
+- **Empty folders** are stored as a zero-byte marker whose key ends in `/` (manifest entry has `"type": "dir"`).
+- **Skipped only:** `.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `site-packages`, `restored_code/`, symlinks
+  (reported `skipped_symlink`), `*.tmp`, `.tmp_*.json`, files over 10 MB (reported `skipped_large`), and data files
+  inside `output_dir` (they belong to `sweep`). Any other file in `outputs/` is backed up.
+- **Sensitive names** are never uploaded and are reported as `skipped_sensitive_name`: extensions `.pem .key .pfx .p12 .jks
+  .keystore`, files named `.env` / `.env.*`, and json, yaml, yml, toml, ini, cfg, conf or txt files whose name contains
+  `secret`, `credential`, `password`, `passwd`, `token`, `private_key`, `service_account`, `id_rsa`, `apikey` or `api_key`.
+  `.py`, `.md` and `.pdf` are never judged by name. File contents are not inspected, so keep secrets in environment variables.
+- **One live copy**, no date folder: a changed file overwrites its copy; files deleted locally stay in S3.
+- **State** `.fathom_recovery/code_state.json` (path -> sha256, plus `.fathom_layout` and `.fathom_state_synced`). A file is
+  recorded only after its upload is verified (size, `sha256` metadata, content read back). State files never trigger an
+  upload on their own; they are re-uploaded only when something else was uploaded. An idle sweep reports `uploaded=0`.
+- `code/.fathom_manifest.json` (`run_id` "live") is merged on every sweep.
+- Optional config keys: `"code_patterns": ["*.py"]` and `"code_exclude_dirs": ["tmp"]`.
+
+## Upload rules (both sweeps)
+
+Every upload is a `put_object` with `sha256` in the object metadata, then verified: size, metadata and the content hash read
+back from S3. State is written atomically (temp file in `.fathom_recovery/`, then rename) and a file is recorded only after
+it verified, so a failed file is retried next time and never stops the sweep. There are no delete or lifecycle calls anywhere.
+
+## Using it from a panel
+
+Nothing watches files or runs by itself; the panel's code, its agent or a schedule has to call it. The standing rules are:
+
+1. After creating or changing a data file in `outputs/`, run the data sweep as the last step:
+   `python3 -B scripts/fathom_recovery.py sweep --config recovery_config.json --state-file .fathom_recovery/state.json --apply`
+2. After creating or changing anything else (code, `knowledge/`, configs, ...), run the code sweep:
+   `python3 -B scripts/fathom_recovery.py code-sweep --config recovery_config.json --state-file .fathom_recovery/code_state.json --apply`
+3. At the start of every session run both once (`knowledge/` and `.fathom_runtime/` can change under the panel).
+
+From Python, `panel_snippet.py` wraps those two commands: `sweep_now()` and `code_sweep_now()` run the installed CLI with the
+right state files and return `{ok, uploaded, unchanged, failed, exit_code, output}`.
+
+Use `python3 -B` or `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__` appears in the panel.
 
 ## Repo layout
 
 ```
 fathom-recovery/
-  fathom_recovery.py        # the whole library + CLI (single file, needs only boto3)
-  panel_snippet.py          # paste-in block for a panel's generation code
+  fathom_recovery.py              # the whole tool (single file, needs only boto3)
+  setup_panel.py                  # installs the script from this clone and runs its `setup`
+  sync_recovery.py                # pulls a pinned tag from git into a panel
+  panel_snippet.py                # sweep_now() / code_sweep_now() for a panel's own code
   tests/test_fathom_recovery.py   # offline tests, fake S3, no network
   README.md
 ```
 
-## Using it in a panel (rollout)
-
-1. **Get the file into the panel workspace.** Copy `fathom_recovery.py` into the panel's
-   `scripts/` folder (or push this folder to your git remote and pull it in each panel's
-   workspace; that is the way to keep one version across projects).
-2. **Push the panel's output** (see `panel_snippet.py`). Simplest path, `upload_to_recovery`
-   (v1.2.0+), takes bytes, text, or a `pathlib.Path` to a local file:
-
-```python
-from pathlib import Path
-from fathom_recovery import upload_to_recovery
-
-upload_to_recovery(csv_bytes, "report.csv", panel_name=PANEL_NAME)   # bytes / str content
-upload_to_recovery(Path("report.csv"), panel_name=PANEL_NAME)        # local file
-```
-   It writes `6_Recovery/<user>/<PANEL_NAME>/<timestamp>-<8 hex>/<file>` with `sha256` metadata and
-   verifies size, stored sha256 and the content read back; `result["ok"]` is the pass/fail.
-   A plain `str` is treated as **content**; pass a `Path` for a file.
-
-   Other entry points: `copy_created_object_to_recovery(bucket, key, panel_name=...)` for an object
-   already in S3, and `put_object_and_copy_to_recovery(...)` to write a source object and copy it.
-3. **Check it** with a dry run, then `--apply` once (CLI):
-
-```
-python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv            # dry run
-python3 fathom_recovery.py upload --panel-name "My Panel" --file report.csv --apply
-python3 fathom_recovery.py copy   --panel-name "My Panel" --source-bucket B --source-key K [--apply]
-```
-
-### Fastest setup for a new panel (v1.7.2)
-
-Run these in the panel's workspace root (in Fathom, ask the panel's agent to run them). The clone goes
-into a folder named after the version, so running the lines again never fails with "already exists":
-
-```
-[ -d fathom-recovery-v1.7.2 ] || git clone --depth 1 --branch v1.7.2 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.7.2
-python3 fathom-recovery-v1.7.2/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
-```
-
-`setup_panel.py` installs `scripts/fathom_recovery.py` from that clone, writes `recovery_config.json` and
-`RECOVERY_INSTRUCTIONS.md` (an existing config is kept), runs `selfcheck`, and does a first `sweep` and a
-first `code-sweep` (`--skip-code` leaves that one out). Every
-step prints PASS / FAIL. Without `--apply` it is a dry run and writes nothing to S3. `--with-snippet`
-also copies `panel_snippet.py`. A FAIL mentioning AccessDenied or NoCredentialsError means that panel's
-runtime has no S3 permission on `6_Recovery/`. `RECOVERY_INSTRUCTIONS.md` now includes these setup lines, so
-the panel's agent can do the setup itself.
-
-### Making a panel upload new files (v1.5.0+)
-
-Nothing in this repo watches for files or runs by itself. What it does give you is a standing
-instruction for the panel's agent, plus a config file so the command is the same in every panel:
-
-```
-python3 sync_recovery.py --repo <git url> --ref v1.5.0 --dest scripts --run-tests \
-    --panel-name "<Panel>" --output-dir outputs
-```
-
-This installs `scripts/fathom_recovery.py` and writes two local files in the current folder:
-
-- `recovery_config.json` - `{"panel_name": ..., "output_dir": ...}`
-- `RECOVERY_INSTRUCTIONS.md` - the rule for the panel's agent: after creating or changing a data
-  file, run `python3 scripts/fathom_recovery.py sweep --config recovery_config.json --apply`, and
-  run it once at the start of each session.
-
-Give the contents of `RECOVERY_INSTRUCTIONS.md` to the panel's agent as a standing instruction.
-It works only as long as the agent follows it; a missed run leaves files local until the next sweep.
-`sweep` uploads only new or changed files, so running it extra times is safe. For uploads that do
-not depend on the agent, run the same `sweep --config` command on a schedule.
-
-Re-running the install on a panel that already has `recovery_config.json` upgrades the code and
-keeps the config. `init` alone (`fathom_recovery.py init --panel-name "<Panel>"`) writes just
-`recovery_config.json` and never touches S3; add `--with-instructions` (v1.7.1+) to also write
-`RECOVERY_INSTRUCTIONS.md`. `setup_panel.py` and `sync_recovery.py` pass that flag for you.
-
-`fathom_recovery.py setup --panel-name "<Panel>" --output-dir outputs [--apply]` (v1.7.1+) runs the whole
-check from an already-installed script: panel name, config (an existing one is kept), output folder, user and
-panel folder lookup, `selfcheck`, `sweep` and `code-sweep`, one `[PASS]/[FAIL]` line per step. It is a dry run
-unless `--apply`; its only local writes are `recovery_config.json` (if missing), the output folder (if
-missing) and, with `--apply`, `.fathom_recovery/state.json` and `code_state.json`. It never writes
-`RECOVERY_INSTRUCTIONS.md`.
-
-## Code and knowledge backup (v1.7.0)
-
-`sweep` backs up the **data files** a panel writes to `outputs/`. It is unchanged. `code-sweep` is a second,
-separate job that backs up everything else the panel is made of: Python, notebooks, markdown, JS/HTML, SQL,
-YAML/TOML/INI/JSON config, and the whole `knowledge/` folder.
-
-```
-s3://<bucket>/6_Recovery/<user>/<Panel Name>/code/<YYYY-MM-DD>/<relative/path/file>
-```
-
-| Question | Answer |
-|---|---|
-| What is scanned? | The whole workspace (the folder that holds `recovery_config.json`), recursively. |
-| Which files? | `py ipynb md markdown json js jsx ts tsx html htm css sql yaml yml toml ini cfg conf sh r txt pdf`, `Dockerfile`, `Makefile`. Override with `code_patterns` in the config or `--pattern`. |
-| Folder paths | Kept. A file in `scripts/` lands in `code/<date>/scripts/`, a file in `a/b/` lands in `code/<date>/a/b/`. `scripts/setup_panel.py` and `fathom-recovery/setup_panel.py` are two different objects. The same applies to the data sweep: `outputs/reports/q1.csv` lands in `<run>/reports/q1.csv`. |
-| One folder per day | All code sweeps on one UTC day write into ONE folder, `code/<YYYY-MM-DD>/`, with a hidden `.fathom_manifest.json` (path, sha256, size per file, merged across the day). The first sweep of a day uploads every file (a full snapshot); later sweeps that day add only files that changed and overwrite that day's copy. Each day is kept, so you get one version per day. Older `<timestamp>-<8 hex>` runs from v1.7.1 stay readable and restorable. |
-| What is skipped? | Hidden files/folders (`.git`, `.fathom_runtime`, `.fathom_recovery`, `.workspace_meta.json`), `__pycache__`, `node_modules`, `venv`, `site-packages`, symlinks, files over 10 MB (`--max-mb`), and the **data files inside `output_dir`** (the normal `sweep` owns those). Code files inside `outputs/` (for example `outputs/report.py`) are backed up. |
-| Secrets | A config-like file (`json yaml yml toml ini cfg conf txt`) whose name contains `secret`, `credential`, `password`, `token`, `api_key`, `private_key`, `service_account` or `id_rsa` is **not uploaded**. It is listed as `skipped_sensitive_name` so nothing is hidden silently. Code files (`tokenizer.py`) are never judged by name. File contents are not inspected, so do not keep secrets inside code or notes. |
-| State | `.fathom_recovery/code_state.json` (path -> sha256), outside `outputs/`. A file is recorded only after its upload verified (size, `sha256` metadata, content read back), so failures are retried next time. |
-| Safety | Reads local files, writes only copies to S3. No delete calls anywhere in the script. Dry run unless `--apply`. |
-
-```
-python3 scripts/fathom_recovery.py code-sweep   --config recovery_config.json            # dry run
-python3 scripts/fathom_recovery.py code-sweep   --config recovery_config.json --apply
-python3 scripts/fathom_recovery.py list-code    --config recovery_config.json [--run RUN_ID]
-python3 scripts/fathom_recovery.py restore-code --config recovery_config.json --target-dir restored_code [--run RUN_ID] [--apply]
-```
-
-`restore-code` only READS S3. It writes into `--target-dir` (default `restored_code/`, a NEW folder), keeps the
-original relative paths, re-checks every file's `sha256`, and refuses to replace an existing local file unless
-`--overwrite`. Without `--run` it rebuilds the newest version of every file (a full snapshot of the latest
-state); with `--run` it restores exactly that run. It never touches the live panel files by itself: look at the
-restored folder, then copy back what you want.
-
-Optional keys in `recovery_config.json`: `"code_patterns": ["*.py", "*.md"]` and
-`"code_exclude_dirs": ["uploads", "tmp"]` (folder names to skip at any depth).
-`list` (data) no longer shows code runs; use `list-code`.
-
-## Finding and restoring
-
-```
-python3 fathom_recovery.py list    --panel-name "My Panel" [--user someone] [--limit 20]
-python3 fathom_recovery.py restore --recovery-path "<user>/My Panel/<run>/<file>" \
-                                   --target-bucket B --target-key K            # dry run
-                                   # add --apply to restore, --overwrite to replace an existing target
-```
-`list` is read-only and newest-first; it also shows older flat/legacy objects (run id `null`).
-`restore` refuses to overwrite an existing target unless `--overwrite`, and re-checks the stored `sha256`.
-
-## Tests
-
-```
-python3 -m unittest discover -s tests -v
-```
-Offline only; nothing touches S3.
-
-## Rules of thumb
-
-- A panel is only protected once something calls the helper: its generation code, its agent following
-  `RECOVERY_INSTRUCTIONS.md`, or a schedule.
-- Case and extra spaces in the panel name don't matter (v1.4.0+), but a typo still creates a new folder.
-- The helper never deletes anything. Retention/cleanup, if wanted, should be an S3 lifecycle rule on `6_Recovery/`.
-- Needs AWS credentials with `s3:GetObject` and `s3:PutObject` on the source and recovery locations, and `s3:ListBucket` for `list`.
-  For `upload` only the recovery prefix is needed: `s3:PutObject`, `s3:GetObject` (read-back check) and `s3:ListBucket`
-  on `6_Recovery/*`. Run `selfcheck --apply` in each panel to confirm; AccessDenied means that panel has no access yet.
-- The `<user>` folder is matched ignoring case (`resolve_user_folder()`): `nbhan` uses an existing `NBHAN`.
-  An exact spelling always wins; if only different-case folders exist and there are several (`NBHAN` and `NbHan`),
-  the call fails and the exact spelling must be used. If the listing is not permitted, the name is used as given
-  with a warning. Let `resolve_user()` pick the user (or set `RECOVERY_USER`) instead of hardcoding one.
-- `fathom_recovery.py` also contains `CODE_BACKUP = "1"` (v1.7.0+): `grep -c 'CODE_BACKUP = "1"' scripts/fathom_recovery.py`
-  is 1 when the copy can run `code-sweep`.
-- `fathom_recovery.py` contains the line `LAYOUT = "user/panel"`. A panel can check which layout its copy
-  writes with `grep -c 'LAYOUT = "user/panel"' scripts/fathom_recovery.py` (1 = current, 0 = older panel-first).
-
-## Registered panel names
-
-Spelling matters except for case and extra spaces. Add a row before a panel starts uploading.
-
-| Panel name | Notes |
-|---|---|
-| Fathom Recovery Backup | synthetic test data / selfcheck probes |
-| Daily Checklist Brokerage | existing |
-| Daily Checklist Equities | existing |
-| Equities Checklist EU | existing |
-| Team Daily Checklist Brokerage | existing |
-| Brokerage Recon | existing (folder marker only) |
-
 ## Sharing across panels (git)
 
-**Publish (owner, once per release):** commit, tag (`git tag -a v1.2.0 -m v1.2.0`), and
-`git push origin main v1.2.0` to the shared private repo. Give panel owners read access
-(or a read-only deploy token).
+**Publish (owner):** commit, tag (`git tag -a v1.9.2 -m v1.9.2`) and `git push origin <branch> v1.9.2`.
 
 **Install in a panel:**
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.7.2 --dest scripts --run-tests --panel-name "<Panel>"
+python3 sync_recovery.py --repo <git url> --ref v1.9.2 --dest scripts --run-tests --panel-name "<Panel>" [--apply]
 ```
-(`sync_recovery.py` itself can be run again and again; only a plain `git clone` into an existing folder
-fails, so clone into a new or versioned folder name.)
-Prints the installed version, commit and sha256. Pin a tag, not `main`.
-To upgrade a panel, rerun with the new tag.
 
-**Verify in the panel:**
+Prints the installed version, commit and sha256. Pin a tag, not `main`. `--panel-name` also runs the installed script's
+`setup` (a dry run unless `--apply`).
+
+## Checking a panel's copy
 
 ```
-python3 scripts/fathom_recovery.py selfcheck --panel-name "<Panel>"           # read-only
-python3 scripts/fathom_recovery.py selfcheck --panel-name "<Panel>" --apply   # writes 1 probe file, verifies size + sha256
+grep -c 'LAYOUT = "user/panel"' scripts/fathom_recovery.py
+grep -c 'CODE_BACKUP = "1"'     scripts/fathom_recovery.py
+grep -c 'CODE_FLAT = "1"'       scripts/fathom_recovery.py
+grep -c 'CODE_SCOPE = "all"'    scripts/fathom_recovery.py
+grep -c 'PROBE_DIR = "data-day"' scripts/fathom_recovery.py
 ```
-`selfcheck --apply` leaves a small `selfcheck_probe.txt` in the panel's recovery folder (nothing is ever deleted).
+
+All five print 1 for the v1.9.x script (`__version__ = "1.9.1"`). A script failing only the last is v1.9.0 (probe in a separate timestamp folder); failing
+`CODE_FLAT` is v1.8.x or older (date folders under `code/`); failing `CODE_SCOPE` is v1.7.x (skips hidden files).
+`PROBE_DIR = "data-day"` is a version marker only; the probe logic does not read it.
+
+## Tests
+
+```
+python3 -B -m unittest discover -s tests -v
+```
+
+Offline only; a fake S3 stands in for the bucket and nothing real is written.
+
+## Rules of thumb
+
+- Case and extra spaces in the panel name do not matter, but a typo creates a new folder.
+- The tool never deletes anything. Retention, if wanted, should be an S3 lifecycle rule on `6_Recovery/`.
+- Needs credentials with `s3:PutObject`, `s3:GetObject` (read-back check) and `s3:ListBucket` on `6_Recovery/*`.
+  Run `selfcheck --apply` in each panel to confirm.
+- Never put a secret, password, token or key into a code or knowledge file; use an environment variable.
+- Old objects (older timestamp runs, old `code/<date>/` folders, the legacy panel-first layout) are never moved or renamed;
+  `list`, `list --legacy`, `list-code` and `restore-code` still read them.

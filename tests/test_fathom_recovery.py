@@ -1,49 +1,72 @@
-"""Offline tests (fake S3, no network, no writes). Run: python3 -m unittest discover -s tests -v"""
+"""Offline tests for fathom_recovery v1.9.x (fake S3, no network, nothing real is written).
+
+Run:  python3 -B -m unittest discover -s tests -v
+"""
+import argparse
+import contextlib
 import hashlib
 import io
+import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest import mock
 
 from botocore.exceptions import ClientError
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+sys.path.insert(0, ROOT)
 os.environ["RECOVERY_USER"] = "tester"
+os.environ["RECOVERY_DESTINATION_BUCKET"] = "rec"
+os.environ["RECOVERY_DESTINATION_PREFIX"] = "6_Recovery"
+sys.dont_write_bytecode = True
 import fathom_recovery as fr  # noqa: E402
 
 
-class FakeS3:
-    def __init__(self):
-        self.objs = {}  # (bucket, key) -> dict(data, ct, meta, lm)
-        self.copies = []
+def _no_real_s3(*a, **kw):
+    raise RuntimeError("test tried to create a real S3 client; patch fr.boto3.client with FakeS3")
 
-    def seed(self, b, k, data, ct="text/csv", meta=None):
-        self.objs[(b, k)] = {"data": data, "ct": ct, "meta": meta or {}, "lm": datetime.now(timezone.utc)}
+
+fr.boto3.client = _no_real_s3      # safety net: Base.setUp replaces it with a FakeS3 for the tests that need S3
+
+BASE = "6_Recovery/tester/Test Panel/"
+
+
+class FakeS3:
+    """Minimal S3 stand-in. It has NO delete_object: any delete call would raise AttributeError."""
+
+    def __init__(self):
+        self.objs = {}      # (bucket, key) -> {"data": bytes, "meta": dict}
+        self.puts = []
+
+    def seed(self, b, k, data, meta=None):
+        self.objs[(b, k)] = {"data": data, "meta": dict(meta or {})}
 
     def _get(self, b, k, op):
         if (b, k) not in self.objs:
             raise ClientError({"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}}, op)
         return self.objs[(b, k)]
 
+    def put_object(self, Bucket, Key, Body, Metadata=None, **kw):
+        self.puts.append(Key)
+        self.seed(Bucket, Key, Body, Metadata)
+
     def head_object(self, Bucket, Key):
         o = self._get(Bucket, Key, "HeadObject")
-        return {"ContentLength": len(o["data"]), "ContentType": o["ct"], "LastModified": o["lm"], "Metadata": o["meta"]}
+        return {"ContentLength": len(o["data"]), "Metadata": o["meta"]}
 
     def get_object(self, Bucket, Key):
-        return {"Body": io.BytesIO(self._get(Bucket, Key, "GetObject")["data"])}
+        o = self._get(Bucket, Key, "GetObject")
+        return {"Body": io.BytesIO(o["data"]), "Metadata": o["meta"]}
 
-    def put_object(self, Bucket, Key, Body, ContentType, Metadata):
-        self.seed(Bucket, Key, Body, ContentType, Metadata)
-
-    def copy_object(self, Bucket, Key, CopySource, MetadataDirective, ContentType=None, Metadata=None):
-        src = self._get(CopySource["Bucket"], CopySource["Key"], "CopyObject")
-        if MetadataDirective == "REPLACE":
-            self.seed(Bucket, Key, src["data"], ContentType, Metadata)
-        else:
-            self.seed(Bucket, Key, src["data"], src["ct"], dict(src["meta"]))
-        self.copies.append(Key)
+    def list_objects_v2(self, Bucket, Prefix="", MaxKeys=1000):
+        keys = [k for (b, k) in self.objs if b == Bucket and k.startswith(Prefix)][:MaxKeys]
+        return {"Contents": [{"Key": k} for k in keys], "KeyCount": len(keys)}
 
     def get_paginator(self, name):
         fs = self
@@ -54,1438 +77,732 @@ class FakeS3:
                 if Delimiter:
                     cps = sorted({Prefix + k[len(Prefix):].split(Delimiter)[0] + Delimiter
                                   for k, _ in keys if Delimiter in k[len(Prefix):]})
-                    direct = [{"Key": k, "Size": len(o["data"]), "LastModified": o["lm"]}
-                              for k, o in keys if Delimiter not in k[len(Prefix):]]
+                    direct = [{"Key": k, "Size": len(o["data"])} for k, o in keys if Delimiter not in k[len(Prefix):]]
                     yield {"Contents": direct, "CommonPrefixes": [{"Prefix": c} for c in cps]}
                 else:
-                    yield {"Contents": [{"Key": k, "Size": len(o["data"]), "LastModified": o["lm"]}
-                                        for k, o in keys]}
+                    yield {"Contents": [{"Key": k, "Size": len(o["data"])} for k, o in keys]}
         return P()
 
+    def keys(self, prefix=""):
+        return sorted(k for (b, k) in self.objs if k.startswith(prefix))
 
 
-class KeyLayout(unittest.TestCase):
-    def test_layout(self):
-        now = datetime(2026, 10, 27, 14, 45, 7, tzinfo=timezone.utc)
-        k = fr.build_destination_key("a/b/report.csv", "Daily Checklist Brokerage", user="test-user", now=now)
-        self.assertRegex(k, r"^6_Recovery/test-user/Daily Checklist Brokerage/20261027T144507Z-[0-9a-f]{8}/report\.csv$")
+class Base(unittest.TestCase):
+    PANEL = "Test Panel"
 
-    def test_unique_per_call(self):
-        a = fr.build_destination_key("x.csv", "P", user="u")
-        b = fr.build_destination_key("x.csv", "P", user="u")
-        self.assertNotEqual(a, b)
-
-    def test_panels_get_separate_folders(self):
-        a = fr.build_destination_key("checklist_state.json", "Panel A", user="u")
-        b = fr.build_destination_key("checklist_state.json", "Panel B", user="u")
-        self.assertTrue(a.startswith("6_Recovery/u/Panel A/"))
-        self.assertTrue(b.startswith("6_Recovery/u/Panel B/"))
-
-    def test_name_is_exact(self):
-        a = fr.build_destination_key("x.csv", "Daily Checklist Equities", user="u")
-        b = fr.build_destination_key("x.csv", "daily checklist equities", user="u")
-        self.assertNotEqual(a.split("/")[2], b.split("/")[2])
-
-    def test_slashes_cannot_escape(self):
-        k = fr.build_destination_key("x.csv", "../Evil/Panel", user="u")
-        self.assertNotIn("..", k)
-        self.assertEqual(len(k.split("/")), 5)  # prefix/user/panel/run/file
-
-    def test_bad_panel_names(self):
-        for bad in ["", "   ", "..", ".", None, "///"]:
-            with self.assertRaises(ValueError, msg=repr(bad)):
-                fr.build_destination_key("x.csv", bad, user="u")
-
-    def test_no_filename(self):
-        with self.assertRaises(ValueError):
-            fr.build_destination_key("folder/", "P", user="u")
-
-    def test_user_resolution(self):
-        self.assertEqual(fr.resolve_user("jdoe@corp.com"), "jdoe")
-        self.assertEqual(fr.resolve_user(None), "tester")  # from RECOVERY_USER
-
-
-class CopyAndPut(unittest.TestCase):
-    def test_put_then_copy_writes_sha_and_content_type(self):
-        s3 = FakeS3()
-        data = b"a,b\n1,2\n"
-        res = fr.put_object_and_copy_to_recovery("src", "out/data.csv", data, panel_name="Equities Checklist EU",
-                                                 destination_bucket="rec", s3=s3)
-        cr = res["copy_result"]
-        self.assertTrue(res["ok"])
-        self.assertEqual(cr["action"], "copied")
-        self.assertTrue(cr["recovery_path"].startswith("tester/Equities Checklist EU/"))
-        dest = s3.copies[0]
-        self.assertEqual(s3.objs[("rec", dest)]["meta"]["sha256"], hashlib.sha256(data).hexdigest())
-        self.assertEqual(s3.objs[("rec", dest)]["ct"], "text/csv")
-        self.assertIn(("src", "out/data.csv"), s3.objs)  # source untouched
-
-    def test_dry_run_writes_nothing(self):
-        s3 = FakeS3()
-        s3.seed("src", "x/y.csv", b"zz")
-        r = fr.copy_created_object_to_recovery("src", "x/y.csv", panel_name="P", destination_bucket="rec",
-                                               dry_run=True, s3=s3)
-        self.assertEqual(r["action"], "would_copy")
-        self.assertEqual(s3.copies, [])
-
-    def test_bad_panel_rejected_before_any_write(self):
-        s3 = FakeS3()
-        with self.assertRaises(ValueError):
-            fr.put_object_and_copy_to_recovery("src", "k.csv", b"x", panel_name=" ", s3=s3)
-        self.assertEqual(s3.objs, {})  # nothing was created
-
-    def test_missing_source_raises(self):
-        with self.assertRaises(ClientError):
-            fr.copy_created_object_to_recovery("src", "nope.csv", panel_name="P", s3=FakeS3())
-
-    def test_two_copies_both_kept(self):
-        s3 = FakeS3()
-        s3.seed("src", "f.csv", b"1")
-        fr.copy_created_object_to_recovery("src", "f.csv", panel_name="P", destination_bucket="rec", s3=s3)
-        fr.copy_created_object_to_recovery("src", "f.csv", panel_name="P", destination_bucket="rec", s3=s3)
-        self.assertEqual(len(set(s3.copies)), 2)
-
-
-class ListAndRestore(unittest.TestCase):
     def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.root = Path(self._td.name)
+        (self.root / "recovery_config.json").write_text(
+            json.dumps({"panel_name": self.PANEL, "output_dir": "outputs"}))
         self.s3 = FakeS3()
-        s = self.s3
-        s.seed("rec", "6_Recovery/u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv", b"v1", meta={"sha256": hashlib.sha256(b"v1").hexdigest()})
-        s.seed("rec", "6_Recovery/u2/Panel A/20261027T110000Z-bbbbbbbb/f.csv", b"v2")
-        s.seed("rec", "6_Recovery/u1/Panel A/", b"")  # folder marker
-        s.seed("rec", "6_Recovery/u1/Panel B/20261027T120000Z-cccccccc/f.csv", b"other")
-        # objects written before v1.6.0, panel-first: <panel>/<user>/<run>/<file>
-        s.seed("rec", "6_Recovery/Panel A/u3/20261026T090000Z-dddddddd/old.csv", b"old")
-        s.seed("rec", "6_Recovery/Panel A/legacy.csv", b"older")
+        p = mock.patch.object(fr.boto3, "client", return_value=self.s3)
+        p.start()
+        self.addCleanup(p.stop)
+        self.day = "20260101"
+        d = mock.patch.object(fr, "now_utc", lambda: datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+        d.start()
+        self.addCleanup(d.stop)
 
-    def test_list_is_scoped_to_user_and_panel(self):
-        rows = fr.list_recoveries("Panel A", user="u1", destination_bucket="rec", s3=self.s3)
-        self.assertEqual([r["recovery_path"] for r in rows], ["u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"])
-        rows2 = fr.list_recoveries("Panel A", user="u2", destination_bucket="rec", s3=self.s3)
-        self.assertEqual([r["recovery_path"] for r in rows2], ["u2/Panel A/20261027T110000Z-bbbbbbbb/f.csv"])
-        rowsb = fr.list_recoveries("Panel B", user="u1", destination_bucket="rec", s3=self.s3)
-        self.assertEqual(len(rowsb), 1)
-
-    def test_list_parsing_and_default_user(self):
-        r = fr.list_recoveries("Panel A", user="u1", destination_bucket="rec", s3=self.s3)[0]
-        self.assertEqual((r["user"], r["panel"], r["run_id"], r["filename"]),
-                         ("u1", "Panel A", "20261027T100000Z-aaaaaaaa", "f.csv"))
-        # no user given -> the current user ("tester" from RECOVERY_USER), who has no objects here
-        self.assertEqual(fr.list_recoveries("Panel A", destination_bucket="rec", s3=self.s3), [])
-
-    def test_users_do_not_see_each_others_panels(self):
-        self.s3.seed("rec", "6_Recovery/tester/Mine/20261027T130000Z-eeeeeeee/m.csv", b"m")
-        self.assertEqual(len(fr.list_recoveries("Mine", destination_bucket="rec", s3=self.s3)), 1)
-        self.assertEqual(fr.list_recoveries("Mine", user="u1", destination_bucket="rec", s3=self.s3), [])
-
-    def test_legacy_listing_finds_old_layout_only(self):
-        rows = fr.list_legacy_recoveries("panel a", destination_bucket="rec", s3=self.s3)
-        self.assertEqual(sorted(r["filename"] for r in rows), ["legacy.csv", "old.csv"])
-        old = [r for r in rows if r["filename"] == "old.csv"][0]
-        self.assertEqual((old["user"], old["run_id"]), ("u3", "20261026T090000Z-dddddddd"))
-        self.assertIsNone([r for r in rows if r["filename"] == "legacy.csv"][0]["run_id"])
-        only_u3 = fr.list_legacy_recoveries("Panel A", user="u3", destination_bucket="rec", s3=self.s3)
-        self.assertEqual([r["filename"] for r in only_u3], ["old.csv"])
-        # a legacy object is restorable by its path
-        r = fr.restore_from_recovery(old["recovery_path"], "live", "o.csv", destination_bucket="rec", s3=self.s3)
-        self.assertTrue(r["ok"])
-
-    def test_restore_verifies_hash(self):
-        p = "u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"
-        r = fr.restore_from_recovery(p, "live", "panel/f.csv", destination_bucket="rec", s3=self.s3)
-        self.assertTrue(r["ok"])
-        self.assertTrue(r["sha256_verified"])
-        self.assertEqual(self.s3.objs[("live", "panel/f.csv")]["data"], b"v1")
-
-    def test_restore_refuses_overwrite(self):
-        self.s3.seed("live", "panel/f.csv", b"current")
-        p = "u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"
-        r = fr.restore_from_recovery(p, "live", "panel/f.csv", destination_bucket="rec", s3=self.s3)
-        self.assertFalse(r["ok"])
-        self.assertEqual(r["action"], "refused")
-        self.assertEqual(self.s3.objs[("live", "panel/f.csv")]["data"], b"current")
-        r2 = fr.restore_from_recovery(p, "live", "panel/f.csv", overwrite=True, destination_bucket="rec", s3=self.s3)
-        self.assertTrue(r2["ok"])
-
-    def test_restore_dry_run_and_bad_path(self):
-        p = "u1/Panel A/20261027T100000Z-aaaaaaaa/f.csv"
-        r = fr.restore_from_recovery(p, "live", "k.csv", dry_run=True, destination_bucket="rec", s3=self.s3)
-        self.assertEqual(r["action"], "would_restore")
-        self.assertNotIn(("live", "k.csv"), self.s3.objs)
-        for bad in ["", "Panel A", "../x/y", "Panel A//f.csv"]:
-            with self.assertRaises(ValueError, msg=bad):
-                fr.restore_from_recovery(bad, "live", "k", destination_bucket="rec", s3=self.s3)
-
-
-class Upload(unittest.TestCase):
-    def test_bytes_upload_layout_and_verification(self):
-        s3 = FakeS3()
-        data = b"a,b\n1,2\n"
-        r = fr.upload_to_recovery(data, "r.csv", panel_name="Panel X", destination_bucket="rec", s3=s3)
-        self.assertTrue(r["ok"], r)
-        self.assertRegex(r["recovery_path"], r"^tester/Panel X/\d{8}T\d{6}Z-[0-9a-f]{8}/r\.csv$")
-        (bucket, key), obj = next(iter(s3.objs.items()))
-        self.assertEqual(bucket, "rec")
-        self.assertTrue(key.startswith("6_Recovery/tester/Panel X/"))
-        self.assertEqual(obj["data"], data)
-        self.assertEqual(obj["meta"]["sha256"], hashlib.sha256(data).hexdigest())
-        self.assertEqual(obj["ct"], "text/csv")
-        self.assertTrue(r["size_verified"] and r["sha256_metadata_verified"] and r["content_verified"])
-
-    def test_str_is_content_and_path_is_file(self):
-        import pathlib
-        import tempfile
-        s3 = FakeS3()
-        fr.upload_to_recovery("hello", "h.txt", panel_name="P", destination_bucket="rec", s3=s3)
-        self.assertEqual(list(s3.objs.values())[0]["data"], b"hello")
-        with tempfile.TemporaryDirectory() as d:
-            p = pathlib.Path(d) / "local.csv"
-            p.write_bytes(b"x,y\n")
-            s3b = FakeS3()
-            r = fr.upload_to_recovery(p, panel_name="P", destination_bucket="rec", s3=s3b)
-            self.assertTrue(r["ok"])
-            self.assertEqual(r["filename"], "local.csv")
-
-    def test_dry_run_writes_nothing(self):
-        s3 = FakeS3()
-        r = fr.upload_to_recovery(b"zz", "f.csv", panel_name="P", dry_run=True, destination_bucket="rec", s3=s3)
-        self.assertEqual(r["action"], "would_upload")
-        self.assertEqual(s3.objs, {})
-
-    def test_validation_before_any_write(self):
-        s3 = FakeS3()
-        for kwargs in ({"panel_name": " "}, {"panel_name": ".."}, {"panel_name": "P", "filename": ""},
-                       {"panel_name": "P", "filename": ".."}):
-            fname = kwargs.pop("filename", "f.csv")
-            with self.assertRaises(ValueError, msg=str(kwargs)):
-                fr.upload_to_recovery(b"x", fname, destination_bucket="rec", s3=s3, **kwargs)
-        with self.assertRaises(TypeError):
-            fr.upload_to_recovery(123, "f.csv", panel_name="P", destination_bucket="rec", s3=s3)
-        self.assertEqual(s3.objs, {})
-
-    def test_filename_cannot_escape_folder(self):
-        s3 = FakeS3()
-        r = fr.upload_to_recovery(b"x", "../../evil.csv", panel_name="P", destination_bucket="rec", s3=s3)
-        self.assertEqual(r["filename"], "evil.csv")
-        self.assertEqual(len(list(s3.objs)[0][1].split("/")), 5)
-
-    def test_two_uploads_both_kept(self):
-        s3 = FakeS3()
-        fr.upload_to_recovery(b"1", "f.csv", panel_name="P", destination_bucket="rec", s3=s3)
-        fr.upload_to_recovery(b"2", "f.csv", panel_name="P", destination_bucket="rec", s3=s3)
-        self.assertEqual(len(s3.objs), 2)
-
-    def test_detects_corruption(self):
-        class Corrupting(FakeS3):
-            def put_object(self, Bucket, Key, Body, ContentType, Metadata):
-                super().put_object(Bucket, Key, Body[:-1] + b"?", ContentType, Metadata)
-        r = fr.upload_to_recovery(b"abcdef", "f.txt", panel_name="P", destination_bucket="rec", s3=Corrupting())
-        self.assertFalse(r["ok"])
-
-    def test_upload_then_list_and_restore(self):
-        s3 = FakeS3()
-        r = fr.upload_to_recovery(b"v1", "f.csv", panel_name="P", destination_bucket="rec", s3=s3)
-        rows = fr.list_recoveries("P", destination_bucket="rec", s3=s3)
-        self.assertEqual([x["recovery_path"] for x in rows], [r["recovery_path"]])
-        rr = fr.restore_from_recovery(r["recovery_path"], "live", "k.csv", destination_bucket="rec", s3=s3)
-        self.assertTrue(rr["ok"] and rr["sha256_verified"])
-
-
-class SelfCheck(unittest.TestCase):
-    def test_dry_run_writes_nothing(self):
-        s3 = FakeS3()
-        r = fr.selfcheck("P", destination_bucket="rec", s3=s3)
-        self.assertTrue(r["ok"])
-        self.assertEqual(s3.objs, {})
-        self.assertIn("skipped", r["steps"][-1]["detail"])
-
-    def test_apply_writes_and_verifies_probe(self):
-        s3 = FakeS3()
-        r = fr.selfcheck("P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertTrue(r["ok"], r)
-        self.assertEqual(len(s3.objs), 1)
-        self.assertEqual([s["ok"] for s in r["steps"]], [True] * 4)
-
-    def test_bad_panel_fails_before_any_io(self):
-        s3 = FakeS3()
-        r = fr.selfcheck("  ", apply=True, destination_bucket="rec", s3=s3)
-        self.assertFalse(r["ok"])
-        self.assertEqual(s3.objs, {})
-
-class Sweep(unittest.TestCase):
-    def setUp(self):
-        import tempfile
-        self._td = tempfile.TemporaryDirectory()
-        self.root = __import__("pathlib").Path(self._td.name)
-        self.addCleanup(self._td.cleanup)
-
-    def w(self, rel, data=b"a,b\n1,2\n"):
+    # helpers
+    def w(self, rel, data="x"):
         p = self.root / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
-        return p
-
-    def test_dry_run_uploads_nothing_and_writes_no_state(self):
-        self.w("a.csv")
-        s3 = FakeS3()
-        r = fr.sweep(self.root, "P", destination_bucket="rec", s3=s3)
-        self.assertEqual((r["would_upload"], r["uploaded"]), (1, 0))
-        self.assertEqual(s3.objs, {})
-        self.assertFalse((self.root / fr.SWEEP_STATE_NAME).exists())
-
-    def test_uploads_new_then_skips_unchanged_then_reuploads_changed(self):
-        self.w("a.csv", b"v1")
-        s3 = FakeS3()
-        r1 = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual((r1["uploaded"], r1["ok"]), (1, True))
-        r2 = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual((r2["uploaded"], r2["unchanged"]), (0, 1))
-        self.assertEqual(len(s3.objs), 1)
-        self.w("a.csv", b"v2")
-        r3 = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual(r3["uploaded"], 1)
-        self.assertEqual(len(s3.objs), 2)  # both versions kept
-
-    def test_new_file_only_is_uploaded(self):
-        self.w("a.csv", b"1")
-        s3 = FakeS3()
-        fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.w("sub/b.csv", b"2")
-        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual((r["uploaded"], r["unchanged"]), (1, 1))
-        self.assertEqual(len(s3.objs), 2)
-
-    def test_patterns_and_skip_dirs(self):
-        self.w("a.csv")
-        self.w("note.md")
-        self.w(".git/x.csv")
-        self.w("knowledge/k.csv")
-        self.w("__pycache__/c.csv")
-        s3 = FakeS3()
-        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual([f["file"] for f in r["files"]], ["a.csv"])
-        r2 = fr.sweep(self.root, "P", patterns=["*.md"], apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual([f["file"] for f in r2["files"]], ["note.md"])
-    def test_subfolders_of_the_data_folder_are_kept_in_s3(self):
-        self.w("top.csv", b"1")
-        self.w("reports/2026/q1.csv", b"2")
-        self.w("reports/summary.json", b"{}")
-        s3 = FakeS3()
-        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual((r["uploaded"], r["ok"]), (3, True), r)
-        tails = sorted(k.split("/", 4)[4] for (_, k) in s3.objs)  # <prefix>/<user>/<panel>/<run>/<this part>
-        self.assertEqual(tails, ["reports/2026/q1.csv", "reports/summary.json", "top.csv"])
-        listed = fr.list_recoveries("P", destination_bucket="rec", s3=s3)
-        self.assertEqual(sorted(x["filename"] for x in listed), ["reports/2026/q1.csv", "reports/summary.json", "top.csv"])
-
-    def test_pdf_files_are_swept_case_insensitively(self):
-        self.assertIn("*.pdf", fr.SWEEP_DEFAULT_PATTERNS)
-        self.w("report.pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-        self.w("sub/SCAN.PDF", b"%PDF-1.7")
-        s3 = FakeS3()
-        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual((r["uploaded"], r["ok"]), (2, True), r)
-        self.assertEqual(sorted(f["file"] for f in r["files"]), ["report.pdf", "sub/SCAN.PDF"])
-        self.assertTrue(all(k.endswith((".pdf", ".PDF")) for (_, k) in s3.objs))
-
-
-
-    def test_state_file_not_uploaded_and_non_recursive(self):
-        self.w("a.json", b"{}")
-        self.w("deep/b.json", b"{}")
-        s3 = FakeS3()
-        r = fr.sweep(self.root, "P", recursive=False, apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual(r["uploaded"], 1)
-        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=s3)  # state file is *.json-named? no
-        names = [f["file"] for f in r["files"]]
-        self.assertNotIn(fr.SWEEP_STATE_NAME, names)
-
-    def test_failed_upload_not_recorded_and_retried(self):
-        self.w("a.csv", b"abcdef")
-
-        class Corrupting(FakeS3):
-            def put_object(self, Bucket, Key, Body, ContentType, Metadata):
-                super().put_object(Bucket, Key, Body[:-1] + b"?", ContentType, Metadata)
-
-        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=Corrupting())
-        self.assertFalse(r["ok"])
-        self.assertEqual(r["failed"], 1)
-        r2 = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=FakeS3())
-        self.assertEqual((r2["uploaded"], r2["ok"]), (1, True))
-
-    def test_exception_in_one_file_does_not_stop_others(self):
-        self.w("a.csv", b"1")
-        self.w("b.csv", b"2")
-
-        class Flaky(FakeS3):
-            n = 0
-
-            def put_object(self, Bucket, Key, Body, ContentType, Metadata):
-                Flaky.n += 1
-                if Flaky.n == 1:
-                    raise ClientError({"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}}, "PutObject")
-                super().put_object(Bucket, Key, Body, ContentType, Metadata)
-
-        r = fr.sweep(self.root, "P", apply=True, destination_bucket="rec", s3=Flaky())
-        self.assertEqual((r["uploaded"], r["failed"], r["ok"]), (1, 1, False))
-
-    def test_bad_panel_or_dir_rejected_before_io(self):
-        s3 = FakeS3()
-        for bad in ("", "..", "<Panel Name given by the user>"):
-            with self.assertRaises(ValueError, msg=bad):
-                fr.sweep(self.root, bad, apply=True, destination_bucket="rec", s3=s3)
-        with self.assertRaises(ValueError):
-            fr.sweep(self.root / "nope", "P", s3=s3)
-        self.assertEqual(s3.objs, {})
-
-
-class PlaceholderGuard(unittest.TestCase):
-    def test_placeholder_panel_names_rejected_everywhere(self):
-        s3 = FakeS3()
-        with self.assertRaises(ValueError):
-            fr.upload_to_recovery(b"x", "f.csv", panel_name="<Panel Name given by the user>", destination_bucket="rec", s3=s3)
-        with self.assertRaises(ValueError):
-            fr.build_destination_key("x.csv", "<name>", user="u")
-        self.assertEqual(s3.objs, {})
-
-    def test_user_with_angle_brackets_is_not_blocked(self):
-        self.assertEqual(fr.resolve_user("a<b"), "a<b")
-
-class PanelSnippet(unittest.TestCase):
-    """panel_snippet.py must import fathom_recovery from its own folder OR from ./scripts."""
-
-    def _run(self, layout):
-        import pathlib
-        import shutil
-        import subprocess
-        import tempfile
-        root = pathlib.Path(__file__).resolve().parent.parent
-        with tempfile.TemporaryDirectory() as d:
-            d = pathlib.Path(d)
-            shutil.copy(root / "panel_snippet.py", d)
-            dest = d / "scripts" if layout == "scripts" else d
-            dest.mkdir(exist_ok=True)
-            shutil.copy(root / "fathom_recovery.py", dest)
-            code = ("import panel_snippet as p, fathom_recovery as f\n"
-                    "assert p.sweep_now and p.push\n"
-                    "print('OK', f.__version__)\n")
-            return subprocess.run([sys.executable, "-c", code], cwd=d, capture_output=True, text=True)
-
-    def test_import_from_scripts_folder(self):
-        r = self._run("scripts")
-        self.assertEqual(r.returncode, 0, r.stderr)
-
-    def test_import_from_same_folder(self):
-        r = self._run("same")
-        self.assertEqual(r.returncode, 0, r.stderr)
-
-    def test_sweep_now_uses_same_default_patterns_as_sweep(self):
-        import inspect
-        import pathlib
-        src = (pathlib.Path(__file__).resolve().parent.parent / "panel_snippet.py").read_text()
-        self.assertIn("SWEEP_DEFAULT_PATTERNS", src)
-        self.assertIn("patterns=None", src)
-        self.assertIn(".txt", ",".join(fr.SWEEP_DEFAULT_PATTERNS))
-
-
-class CaseInsensitivePanel(unittest.TestCase):
-    EXISTING = "6_Recovery/tester/Daily Checklist Equities/20261027T100000Z-aaaaaaaa/f.csv"
-
-    def fs(self):
-        s3 = FakeS3()
-        s3.seed("rec", self.EXISTING, b"old")
-        s3.seed("rec", "6_Recovery/tester/Brokerage Recon/", b"")  # folder marker only
-        return s3
-
-    def test_resolve_matches_existing_ignoring_case_and_spaces(self):
-        s3 = self.fs()
-        for given in ("daily checklist equities", "DAILY CHECKLIST EQUITIES", "  Daily   Checklist  Equities "):
-            self.assertEqual(fr.resolve_panel_folder(given, destination_bucket="rec", s3=s3),
-                             "Daily Checklist Equities", given)
-        self.assertEqual(fr.resolve_panel_folder("brokerage recon", destination_bucket="rec", s3=s3), "Brokerage Recon")
-
-    def test_exact_name_and_new_name(self):
-        s3 = self.fs()
-        self.assertEqual(fr.resolve_panel_folder("Daily Checklist Equities", destination_bucket="rec", s3=s3),
-                         "Daily Checklist Equities")
-        self.assertEqual(fr.resolve_panel_folder("Brand New Panel", destination_bucket="rec", s3=s3), "Brand New Panel")
-
-    def test_ambiguous_existing_folders_raise(self):
-        s3 = self.fs()
-        s3.seed("rec", "6_Recovery/tester/daily checklist equities/r/f.csv", b"x")
-        with self.assertRaises(ValueError):
-            fr.resolve_panel_folder("DAILY CHECKLIST EQUITIES", destination_bucket="rec", s3=s3)
-        # an exact spelling still works
-        self.assertEqual(fr.resolve_panel_folder("daily checklist equities", destination_bucket="rec", s3=s3),
-                         "daily checklist equities")
-
-    def test_upload_uses_existing_folder_spelling(self):
-        s3 = self.fs()
-        r = fr.upload_to_recovery(b"a,b\n", "x.csv", panel_name="daily checklist equities",
-                                  destination_bucket="rec", s3=s3)
-        self.assertTrue(r["ok"], r)
-        self.assertTrue(r["recovery_path"].startswith("tester/Daily Checklist Equities/"))
-        self.assertEqual(r["panel_folder"], "Daily Checklist Equities")
-        self.assertFalse(any(k.startswith("6_Recovery/tester/daily checklist equities/") for (_, k) in s3.objs))
-
-    # ---- user folder is matched case-insensitively (v1.6.1) ----
-    def us(self):
-        s3 = FakeS3()
-        s3.seed("rec", "6_Recovery/NBHAN/Daily Checklist/20261027T100000Z-aaaaaaaa/f.csv", b"old")
-        s3.seed("rec", "6_Recovery/other/Daily Checklist/20261027T100000Z-bbbbbbbb/f.csv", b"o")
-        return s3
-
-    def test_layout_marker(self):
-        self.assertEqual(fr.LAYOUT, "user/panel")
-
-    def test_user_folder_matches_ignoring_case(self):
-        s3 = self.us()
-        for given in ("nbhan", "NbHaN", "NBHAN", "nbhan@corp.com"):
-            self.assertEqual(fr.resolve_user_folder(given, destination_bucket="rec", s3=s3), "NBHAN", given)
-        self.assertEqual(fr.resolve_user_folder("newuser", destination_bucket="rec", s3=s3), "newuser")
-
-    def test_user_folder_ambiguous_raises_but_exact_wins(self):
-        s3 = self.us()
-        s3.seed("rec", "6_Recovery/nbhan/P/r/f.csv", b"x")
-        with self.assertRaises(ValueError):
-            fr.resolve_user_folder("NbHaN", destination_bucket="rec", s3=s3)
-        self.assertEqual(fr.resolve_user_folder("nbhan", destination_bucket="rec", s3=s3), "nbhan")
-        self.assertEqual(fr.resolve_user_folder("NBHAN", destination_bucket="rec", s3=s3), "NBHAN")
-
-    def test_upload_lowercase_user_lands_in_existing_user_folder(self):
-        s3 = self.us()
-        r = fr.upload_to_recovery(b"a\n", "x.csv", panel_name="daily checklist", user="nbhan",
-                                  destination_bucket="rec", s3=s3)
-        self.assertTrue(r["ok"], r)
-        self.assertTrue(r["recovery_path"].startswith("NBHAN/Daily Checklist/"), r["recovery_path"])
-        self.assertFalse([k for (_, k) in s3.objs if k.startswith("6_Recovery/nbhan/")])
-
-    def test_list_and_selfcheck_use_existing_user_folder(self):
-        s3 = self.us()
-        rows = fr.list_recoveries("Daily Checklist", user="nbhan", destination_bucket="rec", s3=s3)
-        self.assertEqual([r["recovery_path"] for r in rows], ["NBHAN/Daily Checklist/20261027T100000Z-aaaaaaaa/f.csv"])
-        self.assertEqual(rows[0]["user"], "NBHAN")
-        res = fr.selfcheck("daily checklist", user="nbhan", apply=True, destination_bucket="rec", s3=s3)
-        self.assertTrue(res["ok"], res)
-        probes = [k for (_, k) in s3.objs if k.endswith("selfcheck_probe.txt")]
-        self.assertEqual(len(probes), 1)
-        self.assertTrue(probes[0].startswith("6_Recovery/NBHAN/Daily Checklist/"), probes)
-
-    def test_sweep_lowercase_user_lands_in_existing_user_folder(self):
-        import tempfile
-        from pathlib import Path
-        s3 = self.us()
-        with tempfile.TemporaryDirectory() as d:
-            Path(d, "a.csv").write_text("1\n")
-            Path(d, "b.json").write_text("{}")
-            r = fr.sweep(d, "DAILY checklist", user="nbhan", apply=True, destination_bucket="rec", s3=s3)
-            self.assertEqual((r["uploaded"], r["failed"]), (2, 0), r)
-        new = [k for (_, k) in s3.objs if k.endswith(("a.csv", "b.json"))]
-        self.assertEqual(len(new), 2)
-        self.assertTrue(all(k.startswith("6_Recovery/NBHAN/Daily Checklist/") for k in new), new)
-
-    def test_user_listing_failure_falls_back_with_warning(self):
-        from botocore.exceptions import ClientError as CE
-
-        class Denied(FakeS3):
-            def get_paginator(self, name):
-                raise CE({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
-        r = fr.upload_to_recovery(b"a\n", "x.csv", panel_name="P", user="nbhan",
-                                  destination_bucket="rec", s3=Denied())
-        self.assertTrue(r["recovery_path"].startswith("nbhan/P/"), r)
-        self.assertIn("warning", r)
-
-    def test_dry_run_reports_matched_folder_and_writes_nothing(self):
-        s3 = self.fs()
-        n = len(s3.objs)
-        r = fr.upload_to_recovery(b"x", "x.csv", panel_name="BROKERAGE RECON", dry_run=True,
-                                  destination_bucket="rec", s3=s3)
-        self.assertTrue(r["recovery_path"].startswith("tester/Brokerage Recon/"))
-        self.assertEqual(len(s3.objs), n)
-
-    def test_list_and_copy_use_matched_folder(self):
-        s3 = self.fs()
-        rows = fr.list_recoveries("DAILY checklist EQUITIES", destination_bucket="rec", s3=s3)
-        self.assertEqual([r["filename"] for r in rows], ["f.csv"])
-        s3.seed("src", "k/y.csv", b"zz")
-        c = fr.copy_created_object_to_recovery("src", "k/y.csv", panel_name="daily checklist equities",
-                                               destination_bucket="rec", s3=s3)
-        self.assertTrue(c["recovery_path"].startswith("tester/Daily Checklist Equities/"))
-
-    def test_sweep_uses_matched_folder(self):
-        import pathlib
-        import tempfile
-        s3 = self.fs()
-        with tempfile.TemporaryDirectory() as d:
-            (pathlib.Path(d) / "a.csv").write_bytes(b"1")
-            (pathlib.Path(d) / "b.csv").write_bytes(b"2")
-            r = fr.sweep(d, "daily checklist equities", apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual(r["uploaded"], 2)
-        self.assertTrue(all(f["recovery_path"].startswith("tester/Daily Checklist Equities/")
-                            for f in r["files"] if f["action"] == "uploaded"))
-
-    def test_selfcheck_probe_uses_matched_folder(self):
-        s3 = self.fs()
-        r = fr.selfcheck("daily checklist equities", apply=True, destination_bucket="rec", s3=s3)
-        self.assertTrue(r["ok"], r)
-        probes = [k for (_, k) in s3.objs if k.endswith("selfcheck_probe.txt")]
-        self.assertEqual(len(probes), 1)
-        self.assertTrue(probes[0].startswith("6_Recovery/tester/Daily Checklist Equities/"))
-
-    def test_listing_failure_falls_back_with_warning(self):
-        class NoList(FakeS3):
-            def get_paginator(self, name):
-                raise ClientError({"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
-                                  "ListObjectsV2")
-        s3 = NoList()
-        r = fr.upload_to_recovery(b"x", "x.csv", panel_name="My Panel", destination_bucket="rec", s3=s3)
-        self.assertTrue(r["ok"])
-        self.assertTrue(r["recovery_path"].startswith("tester/My Panel/"))
-        self.assertIn("warning", r)
-
-    def test_bad_names_still_rejected(self):
-        s3 = self.fs()
-        for bad in ("", "..", "<name>"):
-            with self.assertRaises(ValueError, msg=bad):
-                fr.resolve_panel_folder(bad, destination_bucket="rec", s3=s3)
-
-
-class PanelConfigAndInstructions(unittest.TestCase):
-    def setUp(self):
-        import tempfile
-        self._td = tempfile.TemporaryDirectory()
-        self.addCleanup(self._td.cleanup)
-        self.d = __import__("pathlib").Path(self._td.name)
-
-    def test_init_writes_config_and_instructions(self):
-        r = fr.init_panel("daily checklist brokerage", "outputs", directory=self.d)
-        self.assertTrue(r["ok"])
-        cfg = __import__("json").loads((self.d / "recovery_config.json").read_text())
-        self.assertEqual(cfg, {"panel_name": "daily checklist brokerage", "output_dir": "outputs"})
-        ins = (self.d / "RECOVERY_INSTRUCTIONS.md").read_text()
-        self.assertIn("sweep --config recovery_config.json --apply", ins)
-        self.assertIn("daily checklist brokerage", ins)
-        self.assertIn("Nothing uploads by itself", ins)
-
-    def test_init_normalises_spaces_and_stores_patterns(self):
-        fr.init_panel("  My   Panel ", "out", directory=self.d, patterns=["*.csv"])
-        cfg = __import__("json").loads((self.d / "recovery_config.json").read_text())
-        self.assertEqual((cfg["panel_name"], cfg["patterns"]), ("My Panel", ["*.csv"]))
-
-    def test_init_refuses_overwrite_unless_force(self):
-        fr.init_panel("A", directory=self.d)
-        with self.assertRaises(ValueError):
-            fr.init_panel("B", directory=self.d)
-        self.assertIn('"A"', (self.d / "recovery_config.json").read_text())
-        fr.init_panel("B", directory=self.d, force=True)
-        self.assertIn('"B"', (self.d / "recovery_config.json").read_text())
-
-    def test_init_rejects_bad_names_and_writes_nothing(self):
-        for bad in ("", "..", "<Panel>"):
-            with self.assertRaises(ValueError, msg=bad):
-                fr.init_panel(bad, directory=self.d)
-        self.assertEqual(list(self.d.iterdir()), [])
-
-    def test_load_config_resolves_output_dir_next_to_config(self):
-        fr.init_panel("P", "outputs", directory=self.d)
-        cfg = fr.load_config(self.d / "recovery_config.json")
-        self.assertEqual(cfg["output_dir_resolved"], str((self.d / "outputs").resolve()))
-
-    def test_load_config_errors(self):
-        p = self.d / "recovery_config.json"
-        with self.assertRaises(ValueError):
-            fr.load_config(p)  # missing
-        p.write_text("not json")
-        with self.assertRaises(ValueError):
-            fr.load_config(p)
-        p.write_text('{"panel_name": "<Panel Name>"}')
-        with self.assertRaises(ValueError):
-            fr.load_config(p)  # placeholder
-        p.write_text('{"panel_name": "P", "patterns": "*.csv"}')
-        with self.assertRaises(ValueError):
-            fr.load_config(p)  # patterns must be a list
-
-    def _cli(self, *args, cwd=None):
-        import subprocess
-        root = __import__("pathlib").Path(__file__).resolve().parent.parent
-        env = dict(os.environ, RECOVERY_USER="tester")
-        return subprocess.run([sys.executable, str(root / "fathom_recovery.py"), *args], cwd=cwd,
-                              capture_output=True, text=True, env=env)
-
-    def test_cli_init_then_sweep_config_dry_run_from_other_folder(self):
-        r = self._cli("init", "--panel-name", "Cfg Panel", "--directory", str(self.d))
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        (self.d / "outputs").mkdir()
-        (self.d / "outputs" / "a.csv").write_text("x\n1\n")
-        other = self.d / "elsewhere"
-        other.mkdir()
-        # dry run, run from a DIFFERENT folder: the config path alone must be enough
-        r = self._cli("sweep", "--config", str(self.d / "recovery_config.json"), cwd=other)
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        d = __import__("json").loads(r.stdout)
-        self.assertEqual((d["scanned"], d["would_upload"], d["uploaded"]), (1, 1, 0))
-
-    def test_cli_sweep_config_creates_missing_output_dir(self):
-        self._cli("init", "--panel-name", "Cfg Panel", "--directory", str(self.d))
-        self.assertFalse((self.d / "outputs").exists())
-        r = self._cli("sweep", "--config", str(self.d / "recovery_config.json"))
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertTrue((self.d / "outputs").is_dir())
-        self.assertEqual(__import__("json").loads(r.stdout)["scanned"], 0)
-
-    def test_cli_sweep_needs_panel_or_config(self):
-        r = self._cli("sweep", "--dir", str(self.d))
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("--panel-name or --config", r.stdout)
-
-    def test_cli_explicit_args_override_config(self):
-        self._cli("init", "--panel-name", "From Config", "--directory", str(self.d))
-        (self.d / "other").mkdir()
-        (self.d / "other" / "b.csv").write_text("y\n")
-        r = self._cli("sweep", "--config", str(self.d / "recovery_config.json"),
-                      "--dir", str(self.d / "other"), "--pattern", "*.csv")
-        d = __import__("json").loads(r.stdout)
-        self.assertEqual([f["file"] for f in d["files"]], ["b.csv"])
-
-    def test_sync_with_panel_name_writes_files_and_upgrade_keeps_config(self):
-        import json
-        import shutil
-        import subprocess
-        root = __import__("pathlib").Path(__file__).resolve().parent.parent
-        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
-        ident = ["-c", "user.name=t", "-c", "user.email=t@e.com"]
-        repo = self.d / "repo"
-        repo.mkdir()
-        for f in ("fathom_recovery.py", "sync_recovery.py"):
-            shutil.copy(root / f, repo)
-        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
-        subprocess.run(["git", *ident, "add", "-A"], cwd=repo, check=True, env=env)
-        subprocess.run(["git", *ident, "commit", "-q", "-m", "x"], cwd=repo, check=True, env=env)
-        subprocess.run(["git", *ident, "tag", "v9.9.9"], cwd=repo, check=True, env=env)
-        panel = self.d / "panel"
-        panel.mkdir()
-
-        def run(*extra):
-            return subprocess.run([sys.executable, str(root / "sync_recovery.py"), "--repo", str(repo), "--ref", "v9.9.9",
-                                   "--dest", "scripts", "--panel-name", "Sync Panel", *extra],
-                                  cwd=panel, capture_output=True, text=True, env=env)
-        r = run()
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertTrue((panel / "scripts" / "fathom_recovery.py").is_file())
-        self.assertEqual(json.loads((panel / "recovery_config.json").read_text())["panel_name"], "Sync Panel")
-        self.assertTrue((panel / "RECOVERY_INSTRUCTIONS.md").is_file())
-        # upgrade: rerun with an edited config; it must stay, and the install must still succeed
-        (panel / "recovery_config.json").write_text('{"panel_name": "Edited", "output_dir": "data"}')
-        r = run()
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertEqual(json.loads(r.stdout)["init"]["action"], "kept_existing_config")
-        self.assertIn("Edited", (panel / "recovery_config.json").read_text())
-
-    def test_sync_without_panel_name_writes_no_config(self):
-        import subprocess
-        import shutil
-        root = __import__("pathlib").Path(__file__).resolve().parent.parent
-        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
-        ident = ["-c", "user.name=t", "-c", "user.email=t@e.com"]
-        repo = self.d / "repo2"
-        repo.mkdir()
-        shutil.copy(root / "fathom_recovery.py", repo)
-        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
-        subprocess.run(["git", *ident, "add", "-A"], cwd=repo, check=True, env=env)
-        subprocess.run(["git", *ident, "commit", "-q", "-m", "x"], cwd=repo, check=True, env=env)
-        subprocess.run(["git", *ident, "tag", "v9.9.9"], cwd=repo, check=True, env=env)
-        panel = self.d / "panel2"
-        panel.mkdir()
-        r = subprocess.run([sys.executable, str(root / "sync_recovery.py"), "--repo", str(repo), "--ref", "v9.9.9",
-                            "--dest", "scripts"], cwd=panel, capture_output=True, text=True, env=env)
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertFalse((panel / "recovery_config.json").exists())
-
-
-
-
-class SetupPanel(unittest.TestCase):
-    """setup_panel.py: one-command install/config/check. No S3 is touched (dry run + --skip-selfcheck)."""
-
-    def setUp(self):
-        import tempfile
-        self._td = tempfile.TemporaryDirectory()
-        self.addCleanup(self._td.cleanup)
-        self.d = __import__("pathlib").Path(self._td.name)
-        self.root = __import__("pathlib").Path(__file__).resolve().parent.parent
-
-    def _run(self, *args):
-        import subprocess
-        return subprocess.run([sys.executable, str(self.root / "setup_panel.py"), *args], cwd=self.d,
-                              capture_output=True, text=True)
-
-    def test_setup_installs_writes_config_and_is_rerunnable(self):
-        r = self._run("--panel-name", "  my   panel ", "--skip-selfcheck")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertTrue((self.d / "scripts" / "fathom_recovery.py").is_file())
-        cfg = __import__("json").loads((self.d / "recovery_config.json").read_text())
-        self.assertEqual(cfg["panel_name"], "my panel")
-        self.assertTrue((self.d / "outputs").is_dir())
-        self.assertIn("ALL STEPS PASSED", r.stdout)
-        r2 = self._run("--panel-name", "my panel", "--skip-selfcheck")  # second run must also succeed
-        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
-        self.assertIn("already up to date", r2.stdout)
-        self.assertIn("kept as is", r2.stdout)
-
-    def test_existing_config_is_not_overwritten(self):
-        (self.d / "recovery_config.json").write_text('{"panel_name": "Edited", "output_dir": "data"}')
-        r = self._run("--panel-name", "Other Name", "--skip-selfcheck")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("Edited", (self.d / "recovery_config.json").read_text())
-        self.assertTrue((self.d / "data").is_dir())  # folder from the config in effect, not --output-dir
-        self.assertTrue((self.d / "RECOVERY_INSTRUCTIONS.md").is_file())
-
-    def test_bad_names_fail_clearly_and_write_nothing(self):
-        for bad in ("..", "<Panel Name>", "   "):
-            r = self._run("--panel-name", bad)
-            self.assertEqual(r.returncode, 1, bad)
-            self.assertIn("FAIL", r.stdout)
-            self.assertNotIn("Traceback", r.stdout + r.stderr)
-        self.assertEqual(list(self.d.iterdir()), [])
-
-    def test_dry_run_sweep_reports_without_uploading(self):
-        (self.d / "outputs").mkdir()
-        (self.d / "outputs" / "a.csv").write_text("x\n1\n")
-        r = self._run("--panel-name", "P", "--skip-selfcheck")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("would_upload=1", r.stdout)
-        self.assertIn("uploaded=0", r.stdout)
-        self.assertFalse((self.d / "outputs" / ".fathom_recovery_state.json").exists())
-
-    def test_setup_runs_code_sweep_dry_run_and_skip_code_works(self):
-        (self.d / "knowledge").mkdir()
-        (self.d / "knowledge" / "k.md").write_text("k")
-        (self.d / "main.py").write_text("print(1)")
-        r = self._run("--panel-name", "P", "--skip-selfcheck")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        line = [l for l in r.stdout.splitlines() if "7 code-sweep" in l][0]
-        self.assertIn("(dry run)", line)
-        self.assertIn("uploaded=0", line)
-        self.assertRegex(line, r"would_upload=[4-9]")  # main.py, k.md, config, instructions, scripts/fathom_recovery.py
-        self.assertFalse((self.d / ".fathom_recovery").exists())  # dry run writes no state
-        r2 = self._run("--panel-name", "P", "--skip-selfcheck", "--skip-code")
-        self.assertIn("[SKIP] 7 code-sweep", r2.stdout)
-        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
-
-    def test_with_snippet_copies_it(self):
-        r = self._run("--panel-name", "P", "--skip-selfcheck", "--with-snippet")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertTrue((self.d / "panel_snippet.py").is_file())
-
-
-class SetupCommandAndScopedInit(unittest.TestCase):
-    """v1.7.0 fix: the CLI offers `setup` (as the prompt says) and `init` stays inside the recovery scope."""
-
-    def setUp(self):
-        import pathlib
-        import tempfile
-        self._td = tempfile.TemporaryDirectory()
-        self.addCleanup(self._td.cleanup)
-        self.d = pathlib.Path(self._td.name)
-
-    def _cli(self, *args):
-        import subprocess
-        root = __import__("pathlib").Path(__file__).resolve().parent.parent
-        env = dict(os.environ, RECOVERY_USER="tester")
-        return subprocess.run([sys.executable, str(root / "fathom_recovery.py"), *args], cwd=self.d,
-                              capture_output=True, text=True, env=env)
-
-    def test_cli_init_does_not_write_instructions_by_default(self):
-        r = self._cli("init", "--panel-name", "P")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertTrue((self.d / "recovery_config.json").is_file())
-        self.assertFalse((self.d / "RECOVERY_INSTRUCTIONS.md").exists())
-
-    def test_cli_init_with_instructions_flag_writes_it(self):
-        r = self._cli("init", "--panel-name", "P", "--with-instructions")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertTrue((self.d / "RECOVERY_INSTRUCTIONS.md").is_file())
-
-    def test_setup_is_a_valid_subcommand(self):
-        r = self._cli("setup", "-h")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("--panel-name", r.stdout)
-        self.assertIn("--apply", r.stdout)
-
-    def test_setup_rejects_placeholder_name_and_writes_nothing(self):
-        for bad in ("<Panel Name>", "..", ""):
-            r = self._cli("setup", "--panel-name", bad)
-            self.assertEqual(r.returncode, 1, bad)
-            self.assertIn("[FAIL] 1 panel name", r.stdout)
-        self.assertEqual(list(self.d.iterdir()), [])
-
-    def test_setup_panel_function_dry_run_and_apply_stay_in_scope(self):
-        import json
-        s3 = FakeS3()
-        (self.d / "main.py").write_text("print(1)")
-        (self.d / "outputs").mkdir()
-        (self.d / "outputs" / "a.csv").write_text("x\n1\n")
-        kw = dict(directory=self.d, user="tester", s3=s3)
-        r = fr.setup_panel("My Panel", "outputs", **kw)  # dry run
-        self.assertTrue(r["ok"], r["lines"])
-        self.assertEqual(r["layout"], "user/panel")
-        self.assertEqual(r["code_backup"], "1")
-        self.assertEqual([s["status"] for s in r["steps"]], ["PASS"] * 7)
-        self.assertEqual(s3.objs, {})  # dry run writes nothing to S3
-        self.assertFalse((self.d / ".fathom_recovery").exists())
-        self.assertFalse((self.d / "RECOVERY_INSTRUCTIONS.md").exists())
-        before = {p.name for p in self.d.iterdir()}
-        r = fr.setup_panel("My Panel", "outputs", apply=True, **kw)
-        self.assertTrue(r["ok"], r["lines"])
-        self.assertTrue((self.d / ".fathom_recovery" / "state.json").is_file())
-        self.assertTrue((self.d / ".fathom_recovery" / "code_state.json").is_file())
-        after = {p.name for p in self.d.iterdir()}
-        self.assertEqual(after - before, {".fathom_recovery"})  # nothing else created locally
-        self.assertFalse((self.d / "RECOVERY_INSTRUCTIONS.md").exists())
-        # existing config is kept, not overwritten
-        (self.d / "recovery_config.json").write_text(json.dumps({"panel_name": "Edited", "output_dir": "outputs"}))
-        r = fr.setup_panel("Other", "outputs", **kw)
-        self.assertIn("kept as is", r["lines"][1])
-        self.assertIn("Edited", (self.d / "recovery_config.json").read_text())
-
-
-class InstructionsText(unittest.TestCase):
-    def test_instructions_include_setup_and_versioned_clone(self):
-        ins = fr.render_instructions("My Panel", "outputs")
-        self.assertIn("Setup (once per panel", ins)
-        self.assertIn(f"fathom-recovery-v{fr.__version__}", ins)
-        self.assertIn("setup_panel.py", ins)
-        self.assertIn(fr.REPO_URL, ins)
-        self.assertIn("AccessDenied", ins)
-        self.assertIn("sweep --config recovery_config.json --apply", ins)
-        self.assertIn("Nothing uploads by itself", ins)
-
-    def test_setup_clone_line_is_idempotent_shell(self):
-        ins = fr.render_instructions("P")
-        line = [l for l in ins.splitlines() if "git clone" in l][0]
-        self.assertTrue(line.strip().startswith("[ -d "))  # skipped when the folder already exists
-
-
-
-class CodeSweep(unittest.TestCase):
-    """v1.7.0: whole-workspace code + knowledge backup, folder paths kept, per-run manifest."""
-
-    def setUp(self):
-        import pathlib
-        import tempfile
-        self._td = tempfile.TemporaryDirectory()
-        self.addCleanup(self._td.cleanup)
-        self.d = pathlib.Path(self._td.name)
-
-    def w(self, rel, data=b"x"):
-        p = self.d / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data if isinstance(data, bytes) else data.encode())
         return p
 
-    def sweep(self, s3, **kw):
-        kw.setdefault("apply", True)
-        return fr.code_sweep(self.d, "Code Panel", destination_bucket="rec", s3=s3, **kw)
+    def ns(self, **kw):
+        base = dict(config=str(self.root / "recovery_config.json"), panel_name=None, user=None, apply=True,
+                    state_file=None, legacy=False, run=None, target_dir=None, overwrite=False)
+        base.update(kw)
+        return argparse.Namespace(**base)
 
-    def code_keys(self, s3):
-        return sorted(k for (_, k) in s3.objs if "/code/" in k and not k.endswith(fr.CODE_MANIFEST_NAME))
+    def call(self, fn, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = fn(self.ns(**kw))
+        return rc, buf.getvalue()
 
-    def test_folder_paths_are_kept_and_same_names_do_not_clash(self):
-        self.w("scripts/setup_panel.py", "a")
-        self.w("fathom-recovery/setup_panel.py", "b")
-        self.w("main.py", "c")
-        s3 = FakeS3()
-        r = self.sweep(s3)
-        self.assertTrue(r["ok"], r)
-        self.assertEqual(r["uploaded"], 3)
-        keys = self.code_keys(s3)
-        run = r["run_id"]
-        self.assertEqual(keys, sorted(f"6_Recovery/tester/Code Panel/code/{run}/{p}" for p in
-                                      ("scripts/setup_panel.py", "fathom-recovery/setup_panel.py", "main.py")))
-        self.assertRegex(run, r"^\d{4}-\d{2}-\d{2}$")  # v1.7.2: one folder per UTC day
-        self.assertEqual(run, fr.make_day_folder())
+    @staticmethod
+    def summary(out):
+        m = re.search(r"SUMMARY (.*)", out)
+        return dict(kv.split("=") for kv in m.group(1).split()) if m else {}
 
-    def test_nested_folders_are_recreated_under_the_day_folder(self):
-        self.w("a/b/c/deep.py", "d")
-        self.w("a/top.json", "{}")
-        self.w("root.md", "r")
-        s3 = FakeS3()
-        r = self.sweep(s3)
-        day = r["run_id"]
-        self.assertEqual(self.code_keys(s3), sorted(f"6_Recovery/tester/Code Panel/code/{day}/{p}" for p in
-                                                    ("a/b/c/deep.py", "a/top.json", "root.md")))
-        self.assertEqual(r["recovery_folder"], f"tester/Code Panel/code/{day}/")
+    def sweep(self, **kw):
+        return self.call(fr.cmd_sweep, **kw)
 
-    def test_many_sweeps_on_one_day_make_exactly_one_folder(self):
-        self.w("a.py", "1")
-        s3 = FakeS3()
-        r1 = self.sweep(s3)
-        self.w("b.py", "2")
-        self.w("sub/c.json", "{}")
-        r2 = self.sweep(s3)
-        self.w("a.py", "11")
-        r3 = self.sweep(s3)
-        self.assertEqual({r1["run_id"], r2["run_id"], r3["run_id"]}, {fr.make_day_folder()})
-        days = {k.split("/code/")[1].split("/")[0] for (_, k) in s3.objs}
-        self.assertEqual(days, {fr.make_day_folder()})
-        keys = self.code_keys(s3)
-        self.assertEqual([k.split("/code/")[1].split("/", 1)[1] for k in keys], ["a.py", "b.py", "sub/c.json"])
-        a = [o for (_, k), o in s3.objs.items() if k.endswith("/a.py")][0]
-        self.assertEqual(a["data"], b"11")  # the day's copy holds the latest content
-        mkeys = [k for (_, k) in s3.objs if k.endswith(fr.CODE_MANIFEST_NAME)]
-        self.assertEqual(len(mkeys), 1)
-        m = __import__("json").loads(s3.objs[("rec", mkeys[0])]["data"])
-        self.assertEqual([f["path"] for f in m["files"]], ["a.py", "b.py", "sub/c.json"])  # merged, none dropped
-        self.assertEqual(m["files"][0]["sha256"], hashlib.sha256(b"11").hexdigest())
+    def code(self, **kw):
+        return self.call(fr.cmd_code_sweep, **kw)
 
-    def test_a_new_day_gets_a_new_folder_with_a_full_snapshot(self):
-        self.w("a.py", "1")
-        self.w("sub/b.py", "2")
-        s3 = FakeS3()
-        real = fr.make_day_folder
-        self.addCleanup(setattr, fr, "make_day_folder", real)
-        fr.make_day_folder = lambda now=None: "2026-01-01"
-        r1 = self.sweep(s3)
-        r1b = self.sweep(s3)
-        self.assertEqual((r1["uploaded"], r1b["uploaded"], r1b["unchanged"]), (2, 0, 2))
-        fr.make_day_folder = lambda now=None: "2026-01-02"
-        r2 = self.sweep(s3)
-        self.assertEqual((r2["run_id"], r2["uploaded"], r2["unchanged"]), ("2026-01-02", 2, 0))
-        self.assertEqual(sorted(k.split("/code/")[1] for k in self.code_keys(s3)),
-                         ["2026-01-01/a.py", "2026-01-01/sub/b.py", "2026-01-02/a.py", "2026-01-02/sub/b.py"])
-
-    def test_pdf_in_workspace_is_backed_up_with_pdf_content_type(self):
-        pdf = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n%%EOF\n"  # binary bytes must round-trip
-        self.w("report.pdf", pdf)
-        self.w("docs/Upper.PDF", pdf + b"2")
-        s3 = FakeS3()
-        r = self.sweep(s3)
-        self.assertTrue(r["ok"], r)
-        self.assertEqual(r["uploaded"], 2, r)
-        keys = self.code_keys(s3)
-        self.assertTrue(any(k.endswith("/report.pdf") for k in keys), keys)
-        self.assertTrue(any(k.endswith("/docs/Upper.PDF") for k in keys), keys)
-        body = [v for (_, k), v in s3.objs.items() if k.endswith("/report.pdf")]
-        self.assertEqual(len(body), 1)
-
-    def test_pdf_in_data_dir_is_left_to_the_data_sweep(self):
-        self.w("outputs/a.pdf", b"%PDF-1.4")
-        self.w("notes/b.pdf", b"%PDF-1.4")
-        r = self.sweep(FakeS3(), data_dir=self.d / "outputs")
-        self.assertEqual([f["file"] for f in r["files"] if f["action"] == "uploaded"] or ["notes/b.pdf"], ["notes/b.pdf"])
-        self.assertEqual(r["uploaded"], 1, r)
+    def folder(self):
+        return BASE + self.day + "_current_data/"
 
 
-    def test_knowledge_and_notebooks_are_included(self):
-        self.w("knowledge/_index.md", "k")
-        self.w("knowledge/domains/x.md", "k2")
-        self.w("analysis.ipynb", "{}")
-        self.w("dash.html", "<p>")
-        r = self.sweep(FakeS3())
-        self.assertEqual(r["uploaded"], 4, r)
-
-    def test_hidden_generated_and_state_files_are_skipped(self):
-        self.w(".git/config.py", "g")
-        self.w(".fathom_runtime/workspace_state.json", "{}")
-        self.w(".workspace_meta.json", "{}")
-        self.w(".hidden.py", "h")
-        self.w("pkg/__pycache__/m.py", "c")
-        self.w("node_modules/lib/i.js", "n")
-        self.w(".fathom_recovery/state.json", "{}")
-        self.w("real.py", "r")
-        s3 = FakeS3()
-        r = self.sweep(s3)
-        self.assertEqual([f["file"] for f in r["files"]], ["real.py"])
-        self.assertEqual(r["uploaded"], 1)
-
-    def test_data_files_in_output_dir_are_left_to_normal_sweep_but_code_there_is_backed_up(self):
-        self.w("outputs/result.csv", "a,b")
-        self.w("outputs/summary.json", "{}")
-        self.w("outputs/report.py", "y=1")
-        self.w("settings.json", "{}")  # data-looking file OUTSIDE outputs/ is backed up (it is config)
-        r = self.sweep(FakeS3(), data_dir=self.d / "outputs")
-        self.assertEqual(sorted(f["file"] for f in r["files"]), ["outputs/report.py", "settings.json"])
-
-    def test_unchanged_files_are_not_uploaded_again_changed_ones_update_the_same_day_folder(self):
-        self.w("a.py", "1")
-        self.w("b.py", "2")
-        s3 = FakeS3()
-        r1 = self.sweep(s3)
-        self.assertEqual((r1["uploaded"], r1["unchanged"]), (2, 0))
-        r2 = self.sweep(s3)
-        self.assertEqual((r2["uploaded"], r2["unchanged"]), (0, 2))
-        self.assertNotIn("run_id", r2)
-        n = len(s3.objs)
-        self.w("b.py", "22")
-        r3 = self.sweep(s3)
-        self.assertEqual((r3["uploaded"], r3["unchanged"]), (1, 1))
-        self.assertEqual(r3["run_id"], r1["run_id"])  # same day -> same folder
-        self.assertEqual(len(s3.objs), n)  # b.py and the manifest are updated in place: no extra folder or files
-        self.assertEqual(s3.objs[("rec", f"6_Recovery/tester/Code Panel/code/{r1['run_id']}/b.py")]["data"], b"22")
-
-    def test_state_lives_in_dot_fathom_recovery_and_not_in_outputs(self):
-        (self.d / "outputs").mkdir()
-        self.w("a.py")
-        self.sweep(FakeS3(), data_dir=self.d / "outputs")
-        self.assertTrue((self.d / ".fathom_recovery" / "code_state.json").is_file())
-        self.assertEqual(list((self.d / "outputs").iterdir()), [])
-
-    def test_dry_run_uploads_nothing_and_writes_no_state(self):
-        self.w("a.py")
-        s3 = FakeS3()
-        r = self.sweep(s3, apply=False)
-        self.assertEqual((r["would_upload"], r["uploaded"]), (1, 0))
-        self.assertEqual(s3.objs, {})
-        self.assertFalse((self.d / ".fathom_recovery").exists())
-
-    def test_failed_upload_is_not_recorded_so_it_is_retried(self):
-        self.w("good.py", "g")
-        self.w("bad.py", "b")
-
-        class Flaky(FakeS3):
-            def put_object(self, Bucket, Key, Body, ContentType, Metadata):
-                if Key.endswith("bad.py"):
-                    raise ClientError({"Error": {"Code": "InternalError"}, "ResponseMetadata": {}}, "PutObject")
-                super().put_object(Bucket, Key, Body, ContentType, Metadata)
-        s3 = Flaky()
-        r = self.sweep(s3)
-        self.assertFalse(r["ok"])
-        self.assertEqual((r["uploaded"], r["failed"]), (1, 1))
-        state = __import__("json").loads((self.d / ".fathom_recovery" / "code_state.json").read_text())
-        self.assertEqual([k for k in state if k != fr.CODE_DAY_KEY], ["good.py"])
-        r2 = self.sweep(FakeS3())  # fresh bucket + same state: only bad.py is still pending
-        self.assertEqual((r2["uploaded"], r2["unchanged"]), (1, 1))
-
-    def test_secret_looking_config_names_are_reported_not_uploaded(self):
-        self.w("config/credentials.json", "{}")
-        self.w("api_token.txt", "t")
-        self.w("service_account.json", "{}")
-        self.w("tokenizer.py", "ok = 1")  # code files are never judged by name
-        s3 = FakeS3()
-        r = self.sweep(s3)
-        self.assertEqual(r["skipped_sensitive"], 3)
-        self.assertEqual(r["uploaded"], 1)
-        self.assertEqual(sorted(f["file"] for f in r["files"] if f["action"] == "skipped_sensitive_name"),
-                         ["api_token.txt", "config/credentials.json", "service_account.json"])
-        self.assertFalse(any("credentials" in k or "token.txt" in k for (_, k) in s3.objs))
-
-    def test_large_files_are_skipped_and_reported(self):
-        self.w("big.py", "x" * 50)
-        self.w("small.py", "y")
-        r = self.sweep(FakeS3(), max_bytes=10)
-        self.assertEqual((r["skipped_large"], r["uploaded"]), (1, 1))
-
-    def test_symlinks_are_not_followed(self):
-        self.w("real.py", "r")
-        try:
-            (self.d / "link.py").symlink_to(self.d / "real.py")
-            (self.d / "linkdir").symlink_to(self.d / "scripts_x", target_is_directory=True)
-        except OSError:
-            self.skipTest("symlinks not supported")
-        self.w("scripts_x/inner.py", "i")
-        r = self.sweep(FakeS3())
-        self.assertEqual(sorted(f["file"] for f in r["files"]), ["real.py", "scripts_x/inner.py"])
-
-    def test_exclude_dirs_and_custom_patterns(self):
-        self.w("uploads/a.py")
-        self.w("keep/b.py")
-        self.w("keep/c.rs")
-        r = self.sweep(FakeS3(), exclude_dirs=["uploads"], patterns=["*.py", "*.rs"])
-        self.assertEqual(sorted(f["file"] for f in r["files"]), ["keep/b.py", "keep/c.rs"])
-
-    def test_manifest_is_written_and_hidden_from_listings(self):
-        self.w("a.py", "1")
-        self.w("sub/b.md", "2")
-        s3 = FakeS3()
-        r = self.sweep(s3)
-        self.assertTrue(r["manifest_ok"])
-        mkeys = [k for (_, k) in s3.objs if k.endswith(fr.CODE_MANIFEST_NAME)]
-        self.assertEqual(len(mkeys), 1)
-        m = __import__("json").loads(s3.objs[("rec", mkeys[0])]["data"])
-        self.assertEqual(sorted(f["path"] for f in m["files"]), ["a.py", "sub/b.md"])
-        self.assertEqual(m["files"][0]["sha256"], hashlib.sha256(b"1").hexdigest())
-        self.assertEqual([o["path"] for o in fr.list_code("Code Panel", destination_bucket="rec", s3=s3)],
-                         ["sub/b.md", "a.py"])
-
-    def test_every_object_has_sha256_metadata(self):
-        self.w("a.py", "abc")
-        s3 = FakeS3()
-        self.sweep(s3)
-        for (_, k), o in s3.objs.items():
-            self.assertEqual(o["meta"]["sha256"], hashlib.sha256(o["data"]).hexdigest(), k)
-
-    def test_data_listing_does_not_include_code_runs(self):
-        self.w("a.py")
-        s3 = FakeS3()
-        fr.upload_to_recovery(b"1,2", "d.csv", panel_name="Code Panel", destination_bucket="rec", s3=s3)
-        self.sweep(s3)
-        rows = fr.list_recoveries("Code Panel", destination_bucket="rec", s3=s3)
-        self.assertEqual([r["filename"] for r in rows], ["d.csv"])
-        self.assertEqual(len(fr.list_code("Code Panel", destination_bucket="rec", s3=s3)), 1)
-
-    def test_existing_user_and_panel_folders_are_matched_ignoring_case(self):
-        s3 = FakeS3()
-        s3.seed("rec", "6_Recovery/TESTER/code panel/20260101T000000Z-aaaaaaaa/d.csv", b"1")
-        self.w("a.py")
-        r = self.sweep(s3)
-        self.assertTrue(all(k.startswith("6_Recovery/TESTER/code panel/code/") for k in self.code_keys(s3)), r)
-
-    def test_listing_failure_falls_back_with_warning(self):
-        class NoList(FakeS3):
-            def get_paginator(self, name):
-                raise ClientError({"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
-                                  "ListObjectsV2")
-        self.w("a.py")
-        s3 = NoList()
-        r = self.sweep(s3)
-        self.assertTrue(r["ok"], r)
-        self.assertIn("warning", r)
-        self.assertTrue(self.code_keys(s3)[0].startswith("6_Recovery/tester/Code Panel/code/"))
-
-    def test_bad_panel_name_fails_before_any_io(self):
-        self.w("a.py")
-        s3 = FakeS3()
-        for bad in ("", "..", "<Panel>"):
-            with self.assertRaises(ValueError, msg=bad):
-                fr.code_sweep(self.d, bad, apply=True, destination_bucket="rec", s3=s3)
-        self.assertEqual(s3.objs, {})
-
-    def test_local_files_are_never_modified_and_script_has_no_delete_calls(self):
-        p = self.w("a.py", "keep me")
-        before = (p.read_bytes(), p.stat().st_mtime_ns)
-        self.sweep(FakeS3())
-        self.assertEqual((p.read_bytes(), p.stat().st_mtime_ns), before)
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fathom_recovery.py"),
-                  encoding="utf-8") as fh:
-            src = fh.read()
-        self.assertNotRegex(src, r"delete_object|delete_objects|\.unlink\(|shutil\.rmtree|os\.remove\(")
-
-    def test_empty_workspace_is_fine(self):
-        r = self.sweep(FakeS3())
-        self.assertEqual((r["ok"], r["scanned"], r["uploaded"]), (True, 0, 0))
-        self.assertNotIn("run_id", r)
-
-    def test_old_state_without_a_day_marker_triggers_one_full_snapshot(self):
-        # state written by v1.7.1 has no day marker; the first v1.7.2 sweep of the day must upload everything
-        self.w("a.py", "1")
-        self.w("sub/b.py", "2")
-        state_dir = self.d / ".fathom_recovery"
-        state_dir.mkdir()
-        (state_dir / "code_state.json").write_text(__import__("json").dumps(
-            {"a.py": hashlib.sha256(b"1").hexdigest(), "sub/b.py": hashlib.sha256(b"2").hexdigest()}))
-        r = self.sweep(FakeS3())
-        self.assertEqual((r["uploaded"], r["unchanged"]), (2, 0))
-
-
-class CodeRestore(unittest.TestCase):
-    def setUp(self):
-        import pathlib
-        import tempfile
-        self._td = tempfile.TemporaryDirectory()
-        self.addCleanup(self._td.cleanup)
-        self.d = pathlib.Path(self._td.name)
-        self.src = self.d / "panel"
-        self.out = self.d / "restored"
-        self.s3 = FakeS3()
-
-    def w(self, rel, data):
-        p = self.src / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(data)
-
-    def sweep(self):
-        return fr.code_sweep(self.src, "R Panel", apply=True, destination_bucket="rec", s3=self.s3)
-
-    def restore(self, **kw):
-        return fr.restore_code("R Panel", self.out, destination_bucket="rec", s3=self.s3, **kw)
-
-    def two_runs(self):
-        """Two backups on two different days (the code backup keeps one folder per day)."""
-        real = fr.make_day_folder
-        self.addCleanup(setattr, fr, "make_day_folder", real)
-        fr.make_day_folder = lambda now=None: "2026-01-01"
-        self.w("a.py", "a1")
-        self.w("knowledge/k.md", "k1")
-        r1 = self.sweep()
-        fr.make_day_folder = lambda now=None: "2026-01-02"
-        self.w("a.py", "a2")
-        self.w("new/n.py", "n1")
-        r2 = self.sweep()  # a new day starts with a full snapshot
-        return r1["run_id"], r2["run_id"]
-
-    def test_latest_restores_newest_version_of_every_file_with_folders(self):
-        self.two_runs()
-        r = self.restore()
-        self.assertTrue(r["ok"], r)
-        self.assertEqual(r["restored"], 3)
-        self.assertEqual((self.out / "a.py").read_text(), "a2")
-        self.assertEqual((self.out / "knowledge" / "k.md").read_text(), "k1")
-        self.assertEqual((self.out / "new" / "n.py").read_text(), "n1")
-
-    def test_latest_is_right_when_a_file_changes_twice_on_the_same_day(self):
-        self.w("a.py", "old")
-        self.sweep()
-        self.w("a.py", "new")
-        r = self.sweep()
-        self.restore()
-        self.assertEqual((self.out / "a.py").read_text(), "new")
-        self.assertEqual(len(fr.summarize_code_runs(fr.list_code("R Panel", destination_bucket="rec", s3=self.s3))), 1)
-        self.assertEqual(r["run_id"], fr.make_day_folder())
-
-    def test_old_timestamp_runs_and_new_day_folders_restore_together(self):
-        # a panel that already has v1.7.1 '<timestamp>-<hex>' runs keeps working after the switch to day folders
-        self.s3.seed("rec", "6_Recovery/tester/R Panel/code/20251231T120000Z-abcdef12/a.py", b"legacy",
-                     meta={"sha256": hashlib.sha256(b"legacy").hexdigest()})
-        self.s3.seed("rec", "6_Recovery/tester/R Panel/code/20251231T120000Z-abcdef12/old_only.py", b"o",
-                     meta={"sha256": hashlib.sha256(b"o").hexdigest()})
-        self.w("a.py", "fresh")
-        self.sweep()
-        runs = fr.summarize_code_runs(fr.list_code("R Panel", destination_bucket="rec", s3=self.s3))
-        self.assertEqual([r["run_id"] for r in runs], [fr.make_day_folder(), "20251231T120000Z-abcdef12"])
-        self.restore()
-        self.assertEqual((self.out / "a.py").read_text(), "fresh")
-        self.assertEqual((self.out / "old_only.py").read_text(), "o")
-
-    def test_latest_still_works_if_a_manifest_is_missing(self):
-        self.two_runs()
-        for k in [k for (_, k) in self.s3.objs if k.endswith(fr.CODE_MANIFEST_NAME)]:
-            del self.s3.objs[("rec", k)]
-        self.restore()
-        self.assertEqual((self.out / "knowledge" / "k.md").read_text(), "k1")
-        self.assertIn((self.out / "a.py").read_text(), {"a1", "a2"})
-
-    def test_restore_one_run_gives_exactly_that_runs_files(self):
-        r1, _ = self.two_runs()
-        r = self.restore(run=r1)
-        self.assertEqual(sorted(f["file"] for f in r["files"]), ["a.py", "knowledge/k.md"])
-        self.assertEqual((self.out / "a.py").read_text(), "a1")
-
-    def test_unknown_run_is_an_error(self):
-        self.two_runs()
-        with self.assertRaises(ValueError):
-            self.restore(run="20000101T000000Z-deadbeef")
-
-    def test_dry_run_writes_nothing_locally(self):
-        self.two_runs()
-        r = self.restore(dry_run=True)
-        self.assertEqual(r["would_restore"], 3)
-        self.assertFalse(self.out.exists())
-
-    def test_existing_local_file_is_refused_unless_overwrite(self):
-        self.two_runs()
-        self.out.mkdir()
-        (self.out / "a.py").write_text("LOCAL")
-        r = self.restore()
-        self.assertEqual((r["refused_exists"], r["restored"]), (1, 2))
-        self.assertEqual((self.out / "a.py").read_text(), "LOCAL")
-        r = self.restore(overwrite=True)
-        self.assertEqual((self.out / "a.py").read_text(), "a2")
-
-    def test_restore_never_touches_the_live_panel_or_s3(self):
-        self.two_runs()
-        n = len(self.s3.objs)
-        live = (self.src / "a.py").read_text()
-        self.restore()
-        self.assertEqual((self.src / "a.py").read_text(), live)
-        self.assertEqual(len(self.s3.objs), n)
-
-    def test_corrupted_object_is_detected(self):
-        self.two_runs()
-        for (b, k), o in self.s3.objs.items():
-            if k.endswith("n.py"):
-                o["data"] = b"tampered"
-        r = self.restore()
-        self.assertFalse(r["ok"])
-        self.assertEqual(r["failed"], 1)
-        self.assertFalse((self.out / "new" / "n.py").exists())
-
-    def test_path_traversal_in_a_key_cannot_escape_target_dir(self):
-        self.two_runs()
-        base = [k for (_, k) in self.s3.objs if k.endswith("a.py")][0]
-        run_prefix = base.rsplit("/", 1)[0]
-        self.s3.seed("rec", run_prefix + "/../../../../evil.py", b"x", meta={"sha256": hashlib.sha256(b"x").hexdigest()})
-        r = self.restore()
-        self.assertFalse((self.d / "evil.py").exists())
-        self.assertFalse(r["ok"])
-        self.assertTrue(any(f["action"] == "failed" and f["error"] == "unsafe path" for f in r["files"]))
-
-    def test_nothing_backed_up_yet_restores_nothing(self):
-        r = self.restore()
-        self.assertEqual((r["ok"], r["restored"]), (True, 0))
-
-
-class CodeCli(unittest.TestCase):
-    def setUp(self):
-        import pathlib
-        import tempfile
-        self._td = tempfile.TemporaryDirectory()
-        self.addCleanup(self._td.cleanup)
-        self.d = pathlib.Path(self._td.name)
-
-    def cli(self, *args, cwd=None):
-        import subprocess
-        root = __import__("pathlib").Path(__file__).resolve().parent.parent
-        env = dict(os.environ, RECOVERY_USER="tester")
-        return subprocess.run([sys.executable, str(root / "fathom_recovery.py"), *args], cwd=cwd,
-                              capture_output=True, text=True, env=env)
-
-    def test_code_sweep_dry_run_via_config_from_another_folder(self):
-        import json
-        fr.init_panel("Cli Panel", "outputs", directory=self.d)
-        (self.d / "outputs").mkdir()
-        (self.d / "outputs" / "a.csv").write_text("x\n1\n")
-        (self.d / "main.py").write_text("print(1)")
-        (self.d / "knowledge").mkdir()
-        (self.d / "knowledge" / "k.md").write_text("k")
-        other = self.d / "elsewhere"
-        other.mkdir()
-        r = self.cli("code-sweep", "--config", str(self.d / "recovery_config.json"), cwd=other)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        out = json.loads(r.stdout)
-        self.assertFalse(out["applied"])
-        # the config + instructions files are workspace files too, so they are backed up; outputs/a.csv is not
-        self.assertEqual(sorted(f["file"] for f in out["files"]),
-                         ["RECOVERY_INSTRUCTIONS.md", "knowledge/k.md", "main.py", "recovery_config.json"])
-        self.assertFalse((self.d / ".fathom_recovery").exists())
-        self.assertNotIn("mosaic-derivatives-margining", r.stdout)  # bucket stays redacted
-
-    def test_code_sweep_needs_panel_or_config(self):
-        r = self.cli("code-sweep")
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("needs --panel-name or --config", r.stdout)
-
-    def test_config_code_keys_are_validated_and_used(self):
-        import json
-        (self.d / "recovery_config.json").write_text(json.dumps(
-            {"panel_name": "P", "code_patterns": ["*.py"], "code_exclude_dirs": ["skipme"]}))
-        (self.d / "a.py").write_text("1")
-        (self.d / "b.md").write_text("2")
-        (self.d / "skipme").mkdir()
-        (self.d / "skipme" / "c.py").write_text("3")
-        r = self.cli("code-sweep", "--config", str(self.d / "recovery_config.json"))
-        self.assertEqual([f["file"] for f in json.loads(r.stdout)["files"]], ["a.py"])
-        (self.d / "recovery_config.json").write_text(json.dumps({"panel_name": "P", "code_patterns": "*.py"}))
-        r = self.cli("code-sweep", "--config", str(self.d / "recovery_config.json"))
-        self.assertEqual(r.returncode, 1)
-
-    def test_instructions_cover_code_sweep_at_task_end_and_session_start(self):
-        ins = fr.render_instructions("My Panel", "outputs")
-        self.assertIn("code-sweep --config recovery_config.json --apply", ins)
-        self.assertIn("knowledge/", ins)
-        self.assertIn("run BOTH commands", ins)
-        self.assertIn("/code/<YYYY-MM-DD>/", ins)
-        self.assertIn("sweep --config recovery_config.json --apply", ins)  # data rule is still there
-
-    def test_markers(self):
-        self.assertEqual(fr.__version__, "1.7.2")
+class Markers(unittest.TestCase):
+    def test_header_markers_and_version(self):
         self.assertEqual(fr.LAYOUT, "user/panel")
         self.assertEqual(fr.CODE_BACKUP, "1")
+        self.assertEqual(fr.CODE_FLAT, "1")
+        self.assertEqual(fr.CODE_SCOPE, "all")
+        self.assertEqual(fr.PROBE_DIR, "data-day")
+        self.assertEqual(fr.__version__, "1.9.1")
+
+    def test_grep_style_marker_lines_exist_once(self):
+        text = Path(ROOT, "fathom_recovery.py").read_text()
+        for line in ('LAYOUT = "user/panel"', 'CODE_BACKUP = "1"', 'CODE_FLAT = "1"',
+                     'CODE_SCOPE = "all"', 'PROBE_DIR = "data-day"'):
+            self.assertEqual(text.count(line), 1, line)
+
+    def test_no_delete_or_lifecycle_calls_in_script(self):
+        text = Path(ROOT, "fathom_recovery.py").read_text()
+        for bad in ("delete_object", "delete_objects", "lifecycle", "delete_bucket", "os.remove", "shutil.rmtree"):
+            self.assertNotIn(bad, text, bad)
+
+    def test_cli_commands(self):
+        r = subprocess.run([sys.executable, "-B", os.path.join(ROOT, "fathom_recovery.py"), "--help"],
+                           capture_output=True, text=True)
+        for cmd in ("setup", "sweep", "code-sweep", "selfcheck", "list", "list-code", "restore-code",
+                    "verify-code", "restore"):
+            self.assertIn(cmd, r.stdout)
+        self.assertNotIn("init,", r.stdout)
 
 
-class Defaults(unittest.TestCase):
-    def test_target_defaults(self):
-        self.assertEqual(fr.DESTINATION_BUCKET, "mosaic-derivatives-margining")
-        self.assertEqual(fr.DESTINATION_PREFIX, "6_Recovery/")
+class Names(unittest.TestCase):
+    def test_bad_panel_names(self):
+        for bad in ("", "  ", ".", "..", "a<b", "a>b", "<Panel Name>"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                fr.check_panel_name(bad)
+        self.assertEqual(fr.check_panel_name("Daily Checklist"), "Daily Checklist")
+
+    def test_safe_segment_and_rel_ok(self):
+        self.assertEqual(fr.safe_segment("a/b\\c"), "a b c")
+        with self.assertRaises(ValueError):
+            fr.safe_segment("..")
+        self.assertTrue(fr.rel_ok("a/b/c.py"))
+        self.assertTrue(fr.rel_ok("outputs/"))
+        for bad in ("a/../b", "./a", "a//b", ""):
+            self.assertFalse(fr.rel_ok(bad), bad)
+
+    def test_user_resolution_env(self):
+        self.assertEqual(fr.resolve_user(None), "tester")
+        self.assertEqual(fr.resolve_user("Other"), "Other")
+
+
+class FolderMatching(Base):
+    def test_exact_wins_and_case_insensitive_match(self):
+        self.s3.seed("rec", "6_Recovery/TESTER/test  panel/x.txt", b"1")
+        self.sweep()          # resolves user 'tester' -> existing 'TESTER'; panel -> existing 'test  panel'
+        rc, out = self.sweep()
+        self.assertIn("RESOLVED user folder 'TESTER', panel folder 'test  panel'", out)
+
+    def test_ambiguous_folder_needs_exact_spelling(self):
+        self.s3.seed("rec", "6_Recovery/NBHAN/a", b"1")
+        self.s3.seed("rec", "6_Recovery/NbHan/a", b"1")
+        with self.assertRaises(SystemExit) as cm:
+            fr.build_ctx(self.ns(user="nbhan"))
+        self.assertIn("exact spelling", str(cm.exception))
+        # exact spelling wins even when several differ only by case
+        c = fr.build_ctx(self.ns(user="NBHAN"))
+        self.assertEqual(c.user, "NBHAN")
+
+    def test_new_names_use_given_spelling(self):
+        c = fr.build_ctx(self.ns())
+        self.assertEqual((c.user, c.panel), ("tester", "Test Panel"))
+        self.assertEqual(c.base, BASE)
+
+
+class Sweep(Base):
+    def test_dry_run_uploads_nothing_and_writes_no_state(self):
+        self.w("outputs/a.csv", "1,2")
+        rc, out = self.sweep(apply=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("would_upload: " + self.day + "_current_data/a.csv", out)
+        self.assertEqual(self.s3.puts, [])
+        self.assertFalse((self.root / ".fathom_recovery").exists())
+
+    def test_upload_goes_to_day_folder_with_sha_manifest_and_subfolders(self):
+        self.w("outputs/a.csv", "1,2")
+        self.w("outputs/reports/q1.json", "{}")
+        self.w("outputs/SCAN.PDF", b"%PDF-1.4")
+        self.w("outputs/notes.py", "print(1)")          # not a data extension
+        self.w("outputs/noext", "x")
+        rc, out = self.sweep()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.summary(out), {"uploaded": "3", "unchanged": "0", "failed": "0"})
+        keys = self.s3.keys(self.folder())
+        self.assertEqual([k[len(self.folder()):] for k in keys],
+                         [".fathom_manifest.json", "SCAN.PDF", "a.csv", "reports/q1.json"])
+        o = self.s3.objs[("rec", self.folder() + "a.csv")]
+        self.assertEqual(o["meta"]["sha256"], hashlib.sha256(b"1,2").hexdigest())
+        m = json.loads(self.s3.objs[("rec", self.folder() + ".fathom_manifest.json")]["data"])
+        self.assertEqual(m["run_id"], self.day + "_current_data")
+        self.assertEqual(sorted(f["path"] for f in m["files"]), ["SCAN.PDF", "a.csv", "reports/q1.json"])
+        self.assertIn("data_folder=" + self.day + "_current_data", out)
+        # no timestamp run folder anywhere
+        self.assertFalse([k for k in self.s3.keys() if re.search(r"/\d{8}T\d{6}Z-[0-9a-f]{8}/", k)])
+
+    def test_second_sweep_unchanged_then_changed_file_overwrites_same_day_folder(self):
+        self.w("outputs/a.csv", "1")
+        self.w("outputs/b.csv", "2")
+        self.sweep()
+        rc, out = self.sweep()
+        self.assertEqual(self.summary(out), {"uploaded": "0", "unchanged": "2", "failed": "0"})
+        self.assertIn("nothing to upload", out)
+        self.w("outputs/b.csv", "22")
+        rc, out = self.sweep()
+        self.assertEqual(self.summary(out), {"uploaded": "1", "unchanged": "1", "failed": "0"})
+        self.assertEqual(self.s3.objs[("rec", self.folder() + "b.csv")]["data"], b"22")
+        days = {k.split("/")[3] for k in self.s3.keys(BASE)}
+        self.assertEqual(days, {self.day + "_current_data"})
+        m = json.loads(self.s3.objs[("rec", self.folder() + ".fathom_manifest.json")]["data"])
+        self.assertEqual(sorted(f["path"] for f in m["files"]), ["a.csv", "b.csv"])   # merged, none dropped
+
+    def test_nothing_new_creates_no_folder(self):
+        (self.root / "outputs").mkdir()
+        rc, out = self.sweep()
+        self.assertEqual(self.summary(out)["uploaded"], "0")
+        self.assertEqual(self.s3.keys(), [])
+
+    def test_new_utc_day_creates_a_new_folder_and_leaves_yesterday_alone(self):
+        self.w("outputs/a.csv", "1")
+        self.sweep()
+        self.w("outputs/new.csv", "n")
+        with mock.patch.object(fr, "now_utc", lambda: datetime(2026, 1, 2, 0, 5, tzinfo=timezone.utc)):
+            rc, out = self.sweep()
+        self.assertEqual(self.summary(out)["uploaded"], "1")
+        self.assertIn(BASE + "20260102_current_data/new.csv", self.s3.keys())
+        self.assertNotIn(BASE + "20260102_current_data/a.csv", self.s3.keys())    # unchanged, not re-copied
+        self.assertNotIn(BASE + "20260101_current_data/new.csv", self.s3.keys())  # yesterday untouched
+
+    def test_failed_upload_is_not_recorded_and_retried(self):
+        self.w("outputs/a.csv", "1")
+        real = self.s3.put_object
+        self.s3.put_object = mock.Mock(side_effect=RuntimeError("boom"))
+        rc, out = self.sweep()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.summary(out)["failed"], "1")
+        self.s3.put_object = real
+        rc, out = self.sweep()
+        self.assertEqual(self.summary(out), {"uploaded": "1", "unchanged": "0", "failed": "0"})
+
+    def test_access_denied_stops_with_exit_2(self):
+        self.w("outputs/a.csv", "1")
+        err = ClientError({"Error": {"Code": "AccessDenied"}}, "PutObject")
+        self.s3.put_object = mock.Mock(side_effect=err)
+        with self.assertRaises(ClientError):
+            self.sweep()          # cmd_sweep re-raises; main() turns it into 'STOP:' + exit 2
+        self.assertTrue(fr.is_stop(err))
+        self.assertTrue(fr.is_stop(fr.NoCredentialsError()))
+
+
+class CodeSweep(Base):
+    def populate(self):
+        self.w("scripts/a.py", "print(1)")
+        self.w("knowledge/_index.md", "k")
+        self.w("knowledge/technical/apis.md", "api")
+        self.w(".workspace_meta.json", "{}")
+        self.w(".fathom_runtime/workspace_state.json", "{}")
+        self.w(".fathom_runtime/workspace.lock", b"")            # empty file
+        self.w("tokenizer.py", "# code files are never judged by name")
+        (self.root / "outputs").mkdir()                          # empty folder -> marker
+        (self.root / "empty_dir").mkdir()
+
+    def test_whole_workspace_goes_to_code_with_paths_hidden_empty_files_and_dir_markers(self):
+        self.populate()
+        self.w("outputs/data.csv", "1")                           # data in outputs -> sweep owns it
+        self.w("outputs/report.py", "x")                          # other file in outputs -> backed up
+        rc, out = self.code()
+        self.assertEqual(rc, 0, out)
+        keys = {k[len(BASE + "code/"):] for k in self.s3.keys(BASE + "code/")}
+        for expect in ("scripts/a.py", "knowledge/_index.md", "knowledge/technical/apis.md", ".workspace_meta.json",
+                       ".fathom_runtime/workspace_state.json", ".fathom_runtime/workspace.lock", "tokenizer.py",
+                       "recovery_config.json", "empty_dir/", "outputs/report.py", ".fathom_manifest.json",
+                       ".fathom_recovery/code_state.json"):
+            self.assertIn(expect, keys, expect)
+        self.assertNotIn("outputs/data.csv", keys)
+        self.assertEqual(self.s3.objs[("rec", BASE + "code/.fathom_runtime/workspace.lock")]["data"], b"")
+        self.assertEqual(self.s3.objs[("rec", BASE + "code/empty_dir/")]["data"], b"")
+        m = json.loads(self.s3.objs[("rec", BASE + "code/.fathom_manifest.json")]["data"])
+        self.assertEqual(m["run_id"], "live")
+        dirs = [f for f in m["files"] if f.get("type") == "dir"]
+        self.assertTrue(all(f["path"].endswith("/") for f in dirs))
+        self.assertIn("empty_dir/", [f["path"] for f in dirs])
+        self.assertIn("knowledge_dir_present=True scripts_dir_present=True", out)
+        self.assertIn("uploaded_by_folder:", out)
+        # code lives under ONE live copy, never a date folder
+        self.assertFalse([k for k in keys if re.match(r"\d{4}-\d{2}-\d{2}/|\d{8}T\d{6}Z-", k)])
+
+    def test_sensitive_names_skipped_and_reported_never_uploaded(self):
+        self.populate()
+        for name in ("my_secret.json", "prod_credentials.yaml", "password.txt", "api_key.toml", ".env", ".env.local",
+                     "id.pem", "cert.key", "bundle.pfx", "a.p12", "s.jks", "k.keystore", "service_account.json"):
+            self.w(name, "s")
+        rc, out = self.code()
+        for name in ("my_secret.json", ".env", ".env.local", "cert.key", "service_account.json", "password.txt"):
+            self.assertIn("skipped_sensitive_name: " + name, out)
+            self.assertNotIn(BASE + "code/" + name, self.s3.keys())
+        self.assertIn(BASE + "code/tokenizer.py", self.s3.keys())
+        self.assertEqual(self.summary(out)["skipped_sensitive"], "13")
+
+    def test_large_files_and_symlinks_are_skipped_and_reported(self):
+        self.populate()
+        self.w("big.bin", b"x" * 64)
+        link = self.root / "lnk.py"
+        try:
+            os.symlink(self.root / "tokenizer.py", link)
+            have_link = True
+        except (OSError, NotImplementedError):      # Windows without the symlink privilege: skip only that part
+            have_link = False
+        with mock.patch.object(fr, "MAX_CODE_BYTES", 10):
+            rc, out = self.code()
+        self.assertIn("skipped_large: big.bin", out)
+        self.assertNotIn(BASE + "code/big.bin", self.s3.keys())
+        if have_link:
+            self.assertIn("skipped_symlink: lnk.py", out)
+            self.assertNotIn(BASE + "code/lnk.py", self.s3.keys())
+
+
+    def test_idle_second_sweep_uploads_nothing_and_state_files_do_not_trigger(self):
+        self.populate()
+        self.code()
+        puts = len(self.s3.puts)
+        rc, out = self.code()
+        self.assertEqual(self.summary(out)["uploaded"], "0", out)
+        self.assertEqual(len(self.s3.puts), puts)
+
+    def test_changed_file_overwrites_live_copy_and_state_files_follow(self):
+        self.populate()
+        self.code()
+        self.w("scripts/a.py", "print(2)")
+        rc, out = self.code()
+        self.assertEqual(self.s3.objs[("rec", BASE + "code/scripts/a.py")]["data"], b"print(2)")
+        self.assertGreaterEqual(int(self.summary(out)["uploaded"]), 2)       # file + the state file(s)
+        state = json.loads((self.root / ".fathom_recovery/code_state.json").read_text())
+        self.assertEqual(state[".fathom_layout"], "1")
+        self.assertIs(state[".fathom_state_synced"], True)
+        self.assertEqual(state["scripts/a.py"], hashlib.sha256(b"print(2)").hexdigest())
+        s3_state = json.loads(self.s3.objs[("rec", BASE + "code/.fathom_recovery/code_state.json")]["data"])
+        self.assertEqual(s3_state["scripts/a.py"], state["scripts/a.py"])      # final state uploaded AFTER it was written
+
+    def test_old_state_without_layout_marker_uploads_everything_once(self):
+        self.populate()
+        (self.root / ".fathom_recovery").mkdir()
+        (self.root / ".fathom_recovery/code_state.json").write_text(
+            json.dumps({"scripts/a.py": hashlib.sha256(b"print(1)").hexdigest()}))
+        rc, out = self.code()
+        self.assertIn(BASE + "code/scripts/a.py", self.s3.keys())
+
+    def test_dry_run_writes_nothing(self):
+        self.populate()
+        rc, out = self.code(apply=False)
+        self.assertEqual(self.s3.puts, [])
+        self.assertIn("would_upload: code/scripts/a.py", out)
+        self.assertFalse((self.root / ".fathom_recovery").exists())
+
+    def test_restored_code_folder_and_pycache_are_not_swept(self):
+        self.populate()
+        self.w("restored_code/old.py", "x")
+        self.w("pkg/__pycache__/x.pyc", "x")
+        self.w("node_modules/m.js", "x")
+        self.code()
+        keys = self.s3.keys(BASE + "code/")
+        self.assertFalse([k for k in keys if "restored_code" in k or "__pycache__" in k or "node_modules" in k])
+
+    def test_existing_old_day_folders_inside_code_are_left_alone_and_not_counted(self):
+        self.populate()
+        self.s3.seed("rec", BASE + "code/2025-12-31/old.py", b"o", {"sha256": hashlib.sha256(b"o").hexdigest()})
+        self.s3.seed("rec", BASE + "code/20251231T120000Z-abcdef12/older.py", b"o")
+        self.code()
+        rc, out = self.call(fr.cmd_list_code, run="live")
+        live = [ln for ln in out.splitlines() if "old" not in ln.split("  ")[0]]
+        self.assertNotIn("2025-12-31", out)
+        c = self.summary_counts(out)
+        self.assertEqual(c["S3_FILE_COUNT"], c["MANIFEST_FILE_COUNT"])
+        self.assertEqual(self.s3.objs[("rec", BASE + "code/2025-12-31/old.py")]["data"], b"o")
+
+    @staticmethod
+    def summary_counts(out):
+        return {k: int(v) for k, v in re.findall(r"(S3_FILE_COUNT|MANIFEST_FILE_COUNT)=(\d+)", out)}
+
+
+class SelfCheckAndList(Base):
+    def test_probe_goes_into_todays_current_data_folder_not_a_timestamp_folder(self):
+        (self.root / "outputs").mkdir()
+        rc, out = self.call(fr.cmd_selfcheck)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS: write probe + verify " + self.day + "_current_data/selfcheck_probe.txt", out)
+        self.assertEqual(self.s3.keys(), [self.folder() + "selfcheck_probe.txt"])
+        self.assertFalse(re.search(r"\d{8}T\d{6}Z-[0-9a-f]{8}", " ".join(self.s3.keys())))
+
+    def test_selfcheck_dry_run_writes_nothing_and_rerun_overwrites_one_probe(self):
+        (self.root / "outputs").mkdir()
+        rc, out = self.call(fr.cmd_selfcheck, apply=False)
+        self.assertIn("dry run: probe not written", out)
+        self.assertEqual(self.s3.keys(), [])
+        self.call(fr.cmd_selfcheck)
+        self.call(fr.cmd_selfcheck)
+        self.assertEqual(len(self.s3.keys()), 1)
+
+    def test_probe_is_not_in_the_sweep_manifest(self):
+        self.w("outputs/a.csv", "1")
+        self.call(fr.cmd_selfcheck)
+        self.sweep()
+        m = json.loads(self.s3.objs[("rec", self.folder() + ".fathom_manifest.json")]["data"])
+        self.assertEqual([f["path"] for f in m["files"]], ["a.csv"])
+        self.assertIn(self.folder() + "selfcheck_probe.txt", self.s3.keys())
+
+    def test_selfcheck_fails_when_output_dir_missing(self):
+        rc, out = self.call(fr.cmd_selfcheck, apply=False)
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL: output_dir exists", out)
+
+    def test_list_shows_day_folders_newest_first_and_never_code(self):
+        self.w("outputs/a.csv", "1")
+        self.sweep()
+        self.s3.seed("rec", BASE + "20251231_current_data/x.csv", b"x")
+        self.s3.seed("rec", BASE + "code/a.py", b"x")
+        self.s3.seed("rec", BASE + "20251230T010101Z-abcdef12/old.txt", b"x")
+        rc, out = self.call(fr.cmd_list)
+        names = [ln.split()[0] for ln in out.splitlines() if "files=" in ln]
+        self.assertEqual(names, [self.day + "_current_data", "20251231_current_data", "20251230T010101Z-abcdef12"])
+        self.assertNotIn("code", names)
+        self.assertIn("FOLDERS=3", out)
+
+    def test_list_code_counts_match_manifest(self):
+        self.w("scripts/a.py", "1")
+        (self.root / "outputs").mkdir()
+        self.code()
+        rc, out = self.call(fr.cmd_list_code, run="live")
+        c = CodeSweep.summary_counts(out)
+        self.assertGreater(c["S3_FILE_COUNT"], 0)
+        self.assertEqual(c["S3_FILE_COUNT"], c["MANIFEST_FILE_COUNT"])
+        rc, out = self.call(fr.cmd_list_code)
+        self.assertIn("live code/: entries=", out)
+
+
+class RestoreAndVerify(Base):
+    def seed_workspace(self):
+        self.w("scripts/a.py", "print(1)")
+        self.w("knowledge/k.md", "k")
+        self.w(".hidden", "h")
+        self.w("empty.txt", b"")
+        (self.root / "emptydir").mkdir()
+        (self.root / "outputs").mkdir()
+        self.code()
+
+    def restore(self, **kw):
+        return self.call(fr.cmd_restore_code, **kw)
+
+    def test_restore_code_roundtrip_dry_run_then_apply(self):
+        self.seed_workspace()
+        rc, out = self.restore(apply=False)
+        self.assertIn("would_restore: scripts/a.py", out)
+        self.assertFalse((self.root / "restored_code").exists())
+        rc, out = self.restore()
+        self.assertEqual(rc, 0, out)
+        t = self.root / "restored_code"
+        self.assertEqual((t / "scripts/a.py").read_text(), "print(1)")
+        self.assertEqual((t / ".hidden").read_text(), "h")
+        self.assertEqual((t / "empty.txt").read_bytes(), b"")
+        self.assertTrue((t / "emptydir").is_dir())
+        self.assertTrue((t / "outputs").is_dir())
+        self.assertEqual(sorted(p.name for p in (t / "emptydir").iterdir()), [])
+
+    def test_restore_refuses_existing_file_without_overwrite_and_never_touches_live_files(self):
+        self.seed_workspace()
+        self.restore()
+        (self.root / "restored_code/scripts/a.py").write_text("local edit")
+        rc, out = self.restore()
+        self.assertIn("refused (exists, use --overwrite): scripts/a.py", out)
+        self.assertEqual((self.root / "restored_code/scripts/a.py").read_text(), "local edit")
+        rc, out = self.restore(overwrite=True)
+        self.assertEqual((self.root / "restored_code/scripts/a.py").read_text(), "print(1)")
+        self.assertEqual((self.root / "scripts/a.py").read_text(), "print(1)")
+
+    def test_restore_detects_corrupted_object(self):
+        self.seed_workspace()
+        self.s3.objs[("rec", BASE + "code/scripts/a.py")]["data"] = b"tampered"
+        rc, out = self.restore()
+        self.assertEqual(rc, 1)
+        self.assertIn("failed: scripts/a.py", out)
+        self.assertFalse((self.root / "restored_code/scripts/a.py").exists())
+
+    def test_path_traversal_keys_cannot_escape_target(self):
+        self.seed_workspace()
+        self.s3.seed("rec", BASE + "code/a/../../evil.py", b"e", {"sha256": hashlib.sha256(b"e").hexdigest()})
+        rc, out = self.restore()
+        self.assertIn("rejected key: a/../../evil.py", out)
+        self.assertFalse((self.root.parent / "evil.py").exists())
+        self.assertFalse((self.root / "evil.py").exists())
+
+    def test_restore_adds_files_only_present_in_old_folders_and_run_flag_selects(self):
+        self.seed_workspace()
+        sha = hashlib.sha256(b"old").hexdigest()
+        self.s3.seed("rec", BASE + "code/2025-12-31/only_old.py", b"old", {"sha256": sha})
+        self.s3.seed("rec", BASE + "code/2025-12-31/scripts/a.py", b"OLD A", {"sha256": hashlib.sha256(b"OLD A").hexdigest()})
+        rc, out = self.restore()
+        self.assertEqual((self.root / "restored_code/only_old.py").read_text(), "old")
+        self.assertEqual((self.root / "restored_code/scripts/a.py").read_text(), "print(1)")      # live wins
+        rc, out = self.restore(run="2025-12-31", target_dir="from_old")
+        self.assertEqual((self.root / "from_old/scripts/a.py").read_text(), "OLD A")
+        self.assertFalse((self.root / "from_old/knowledge").exists())
+        rc, out = self.restore(run="live", target_dir="live_only")
+        self.assertFalse((self.root / "live_only/only_old.py").exists())
+
+    def test_verify_code_ok_mismatch_missing_and_s3_only(self):
+        self.seed_workspace()
+        rc, out = self.call(fr.cmd_verify_code)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("mismatch=0 missing_in_s3=0", out)
+        self.w("scripts/a.py", "changed locally")
+        self.w("new_file.py", "n")
+        self.s3.seed("rec", BASE + "code/gone_locally.py", b"g")
+        rc, out = self.call(fr.cmd_verify_code)
+        self.assertEqual(rc, 1)
+        self.assertIn("MISMATCH: scripts/a.py", out)
+        self.assertIn("MISSING_IN_S3: new_file.py", out)
+        self.assertIn("S3_ONLY: gone_locally.py", out)
+        self.assertEqual(self.s3.objs[("rec", BASE + "code/gone_locally.py")]["data"], b"g")    # nothing deleted
+
+    def test_restore_single_object_refuses_existing_target_and_verifies_hash(self):
+        self.seed_workspace()
+        path = "tester/Test Panel/code/scripts/a.py"
+        ns = argparse.Namespace(recovery_path=path, target_bucket="live", target_key="k/a.py", overwrite=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(fr.cmd_restore(ns), 0)
+        self.assertEqual(self.s3.objs[("live", "k/a.py")]["data"], b"print(1)")
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(fr.cmd_restore(ns), 1)
+        ns.overwrite = True
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(fr.cmd_restore(ns), 0)
+
+
+class SetupCommand(Base):
+    def test_setup_apply_runs_selfcheck_sweep_and_code_sweep_in_one_day_folder(self):
+        (self.root / "recovery_config.json").unlink()
+        self.w("outputs/a.csv", "1")
+        self.w("scripts/a.py", "p")
+        ns = argparse.Namespace(panel_name=self.PANEL, output_dir="outputs", config=str(self.root / "recovery_config.json"),
+                                user=None, apply=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = fr.cmd_setup(ns)
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("LAYOUT = user/panel", out)
+        self.assertIn("config written: recovery_config.json", out)
+        cfg = json.loads((self.root / "recovery_config.json").read_text())
+        self.assertEqual(cfg, {"panel_name": self.PANEL, "output_dir": "outputs"})
+        day_keys = self.s3.keys(self.folder())
+        self.assertIn(self.folder() + "selfcheck_probe.txt", day_keys)
+        self.assertIn(self.folder() + "a.csv", day_keys)
+        self.assertIn(BASE + "code/scripts/a.py", self.s3.keys())
+        self.assertEqual({k.split("/")[3] for k in self.s3.keys(BASE)}, {self.day + "_current_data", "code"})
+
+    def test_setup_dry_run_writes_nothing_to_s3(self):
+        (self.root / "outputs").mkdir()
+        ns = argparse.Namespace(panel_name=self.PANEL, output_dir="outputs", config=str(self.root / "recovery_config.json"),
+                                user=None, apply=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(fr.cmd_setup(ns), 0)
+        self.assertEqual(self.s3.keys(), [])
+
+    def test_setup_keeps_existing_config_and_rejects_placeholder_names(self):
+        (self.root / "outputs").mkdir()
+        ns = argparse.Namespace(panel_name="Other Name", output_dir="outputs", config=str(self.root / "recovery_config.json"),
+                                user=None, apply=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fr.cmd_setup(ns)
+        self.assertIn("config kept", buf.getvalue())
+        self.assertEqual(json.loads((self.root / "recovery_config.json").read_text())["panel_name"], self.PANEL)
+        ns.panel_name = "<Panel Name>"
+        with self.assertRaises(ValueError):
+            fr.cmd_setup(ns)
+
+
+def load(name, copy_to=None):
+    """Import a repo module. copy_to: import a COPY placed in that folder, so the module's own location
+    (its _HERE) is the temp folder and it can never discover the real workspace next to the repo."""
+    import importlib.util
+    import shutil
+    path = os.path.join(ROOT, name + ".py")
+    if copy_to:
+        path = shutil.copyfile(path, os.path.join(copy_to, name + ".py"))
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class SetupPanelWrapper(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.cwd = os.getcwd()
+        os.chdir(self._td.name)
+        self.addCleanup(os.chdir, self.cwd)
+        self.sp = load("setup_panel")
+        self.sp.results.clear()
+
+    def fake_run(self, rc=0, out="SUMMARY uploaded=1 unchanged=0 failed=0"):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, rc, out, "")
+        return calls, run
+
+    def test_installs_script_and_calls_the_installed_setup_command(self):
+        calls, run = self.fake_run()
+        with mock.patch.object(self.sp.subprocess, "run", run), contextlib.redirect_stdout(io.StringIO()):
+            rc = self.sp.main(["--panel-name", "My Panel", "--output-dir", "outputs", "--apply"])
+        self.assertEqual(rc, 0)
+        installed = Path("scripts/fathom_recovery.py")
+        self.assertEqual(installed.read_bytes(), Path(ROOT, "fathom_recovery.py").read_bytes())
+        cmd = calls[0]
+        self.assertEqual(cmd[3], "setup")
+        self.assertIn("--apply", cmd)
+        self.assertEqual(cmd[cmd.index("--panel-name") + 1], "My Panel")
+        self.assertNotIn("init", cmd)
+
+    def test_dry_run_does_not_pass_apply_and_bad_names_fail_early(self):
+        calls, run = self.fake_run()
+        with mock.patch.object(self.sp.subprocess, "run", run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.sp.main(["--panel-name", "P"]), 0)
+            self.sp.results.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(self.sp.main(["--panel-name", "<Panel>"]), 1)
+        self.assertNotIn("--apply", calls[0])
+        self.assertEqual(len(calls), 1)         # the bad name never reached the script
+
+    def test_failed_setup_returns_1(self):
+        calls, run = self.fake_run(rc=2, out="STOP: NoCredentialsError: Unable to locate credentials")
+        buf = io.StringIO()
+        with mock.patch.object(self.sp.subprocess, "run", run), contextlib.redirect_stdout(buf):
+            self.assertEqual(self.sp.main(["--panel-name", "P", "--apply"]), 1)
+        self.assertIn("[FAIL] 3 setup", buf.getvalue())
+        self.assertIn("no S3 permission", buf.getvalue())
+
+
+class PanelSnippet(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.cwd = os.getcwd()
+        os.chdir(self._td.name)
+        self.addCleanup(os.chdir, self.cwd)
+        Path("scripts").mkdir()
+        Path("scripts/fathom_recovery.py").write_text("# stub")
+        Path("recovery_config.json").write_text('{"panel_name": "P", "output_dir": "outputs"}')
+        self.ps = load("panel_snippet", copy_to=os.path.join(self._td.name, "scripts"))
+
+    def test_sweep_now_and_code_sweep_now_run_the_cli_with_state_files(self):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "SUMMARY uploaded=2 unchanged=5 failed=0", "")
+        with mock.patch.object(self.ps.subprocess, "run", run), contextlib.redirect_stdout(io.StringIO()):
+            r1 = self.ps.sweep_now()
+            r2 = self.ps.code_sweep_now()
+        self.assertEqual((r1["ok"], r1["uploaded"], r1["unchanged"], r1["failed"]), (True, 2, 5, 0))
+        self.assertEqual(seen[0][seen[0].index("--state-file") + 1], os.path.join(".fathom_recovery", "state.json"))
+        self.assertIn("code-sweep", seen[1])
+        self.assertEqual(seen[1][seen[1].index("--state-file") + 1], os.path.join(".fathom_recovery", "code_state.json"))
+        self.assertTrue(all("--apply" in c for c in seen))
+        self.assertTrue(r2["ok"])
+
+    def test_failures_and_stop_are_reported_not_hidden(self):
+        def run(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 2, "STOP: AccessDenied", "")
+        buf = io.StringIO()
+        with mock.patch.object(self.ps.subprocess, "run", run), contextlib.redirect_stdout(buf):
+            r = self.ps.sweep_now()
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["exit_code"], 2)
+        self.assertIn("PROBLEM", buf.getvalue())
+
+    def test_missing_config_is_a_clear_error(self):
+        os.remove("recovery_config.json")
+        with self.assertRaises(FileNotFoundError):
+            self.ps.sweep_now()
+
+    def test_no_old_api_names_remain(self):
+        text = Path(ROOT, "panel_snippet.py").read_text()
+        for old in ("upload_to_recovery", "SWEEP_DEFAULT_PATTERNS", "copy_created_object_to_recovery", "PANEL_NAME ="):
+            self.assertNotIn(old, text)
+        self.assertTrue(hasattr(self.ps, "sweep_now") and hasattr(self.ps, "code_sweep_now"))
+
+
+class SyncRecovery(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.sr = load("sync_recovery")
+        self.repo = os.path.join(self._td.name, "src")
+        os.makedirs(os.path.join(self.repo, "tests"))
+        Path(self.repo, "fathom_recovery.py").write_text('__version__ = "9.9.9"\n')
+        Path(self.repo, "tests", "test_ok.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertTrue(True)\n")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"], ["git", "commit", "-q", "-m", "x"],
+                    ["git", "tag", "v9.9.9"]):
+            subprocess.run(cmd, cwd=self.repo, env=env, check=True, capture_output=True)
+
+    def test_sync_installs_tagged_file_and_reports_version_and_sha(self):
+        dest = os.path.join(self._td.name, "dest")
+        res = self.sr.sync(self.repo, "v9.9.9", dest, run_tests=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["version"], "9.9.9")
+        self.assertTrue(res["tests"]["ok"])
+        installed = Path(dest, "fathom_recovery.py")
+        self.assertEqual(res["sha256"], hashlib.sha256(installed.read_bytes()).hexdigest())
+
+    def test_unknown_ref_fails_and_run_setup_uses_setup_not_init(self):
+        with self.assertRaises(RuntimeError):
+            self.sr.sync(self.repo, "v0.0.0", os.path.join(self._td.name, "d2"))
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "SUMMARY uploaded=0 unchanged=0 failed=0", "")
+        with mock.patch.object(self.sr.subprocess, "run", run):
+            res = self.sr.run_setup("scripts/fathom_recovery.py", "P", "outputs", apply=False)
+        self.assertTrue(res["ok"])
+        self.assertEqual(seen[0][3], "setup")
+        self.assertNotIn("--apply", seen[0])
+        self.assertNotIn("init", seen[0])
+
+
+class RepoFiles(unittest.TestCase):
+    def test_no_stale_api_names_in_companion_files_or_readme(self):
+        stale = ("upload_to_recovery", "copy_created_object_to_recovery", "put_object_and_copy_to_recovery",
+                 "SWEEP_DEFAULT_PATTERNS", "make_day_folder", "make_run_folder", "list_recoveries", "_require_panel",
+                 "fr.CONFIG_NAME", "render_instructions", "RECOVERY_INSTRUCTIONS.md", "fathom_recovery.py init",
+                 "fathom_recovery.py upload", "fathom_recovery.py copy")
+        for name in ("panel_snippet.py", "setup_panel.py", "sync_recovery.py", "README.md"):
+            text = Path(ROOT, name).read_text()
+            for s in stale:
+                self.assertNotIn(s, text, f"{name} still mentions {s}")
+
+    def test_readme_names_current_version_and_commands(self):
+        text = Path(ROOT, "README.md").read_text()
+        self.assertIn("v1.9.2", text)
+        self.assertNotIn("--branch v1.9.1", text)       # the tag v1.9.1 only has the script, not the companion files
+        for cmd in ("setup", "sweep", "code-sweep", "selfcheck", "list-code", "restore-code", "verify-code"):
+            self.assertIn(cmd, text)
+        self.assertIn("<YYYYMMDD>_current_data", text)
+        self.assertIn('PROBE_DIR = "data-day"', text)
+
+    def test_gitignore_keeps_state_and_bytecode_out(self):
+        text = Path(ROOT, ".gitignore").read_text()
+        for line in ("__pycache__/", "*.pyc", ".fathom_recovery/"):
+            self.assertIn(line, text)
 
 
 if __name__ == "__main__":

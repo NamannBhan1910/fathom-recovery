@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
-.fathom_recovery_state.json
+.fathom_recovery/
+restored_code/
