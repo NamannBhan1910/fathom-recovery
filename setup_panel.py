@@ -3,7 +3,7 @@
 
 Run it from the panel's workspace root, using the copy inside the cloned repo:
 
-    python3 fathom-recovery-v1.9.3/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
+    python3 fathom-recovery-v1.9.4/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
 
 Steps (each prints PASS / FAIL / SKIP):
   1. panel name is valid (empty, '.', '..', '<' and '>' are rejected)
@@ -16,6 +16,9 @@ Steps (each prints PASS / FAIL / SKIP):
   4. with --with-dashboard: copy recovery_sync.py, recovery_hook.js and install_dashboard_hook.py next to the
      installed script and run the installer, which finds the single dashboard HTML in the workspace and (only with
      --apply) inserts one marked hook block. No HTML found or several candidates: it changes nothing (SKIP).
+
+  5. with --with-watcher: copy recovery_watch.py (and the sync script it imports) into the install folder. The
+     watcher is never started by this script.
 
 Dry run by default: nothing is written to S3 unless --apply is given. Safe to run again at any time.
 Exit code 0 only if no step failed.
@@ -31,6 +34,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DASHBOARD_FILES = ("recovery_sync.py", "recovery_hook.js", "install_dashboard_hook.py")
+WATCHER_FILE = "recovery_watch.py"
 results: list[tuple[str, str, str]] = []
 
 
@@ -63,6 +67,9 @@ def main(argv=None) -> int:
     p.add_argument("--with-dashboard", action="store_true",
                    help="also install the dashboard->S3 sync scripts and the hook into the dashboard HTML "
                         "(the hook is only inserted with --apply)")
+    p.add_argument("--with-watcher", action="store_true",
+                   help="also copy recovery_watch.py into --dest (it needs recovery_sync.py, so it is installed "
+                        "together with the dashboard scripts). It is NEVER started here; see the README")
     p.add_argument("--user", default=None, help="override the user folder (default: RECOVERY_USER, whoami, unknown-user)")
     a = p.parse_args(argv)
 
@@ -133,6 +140,23 @@ def main(argv=None) -> int:
                 record("4b hook", "SKIP", "no single dashboard HTML identified; nothing was changed")
             else:
                 record("4b hook", "FAIL", f"exit {r.returncode}: {(out2.splitlines() or [''])[-1][:200]}")
+
+    # 5. change watcher (optional): only copies the files; starting it is a separate, explicit step
+    if a.with_watcher:
+        w_src = os.path.join(HERE, WATCHER_FILE)
+        sync_src = os.path.join(HERE, "recovery_sync.py")      # the only other file the watcher imports
+        sync_dst = os.path.join(a.dest, "recovery_sync.py")
+        if not os.path.isfile(w_src):
+            record("5 watcher", "FAIL", f"{WATCHER_FILE} not found in the clone")
+        elif not os.path.isfile(sync_src) and not os.path.isfile(sync_dst):
+            record("5 watcher", "FAIL", "recovery_sync.py not found (the watcher imports it)")
+        else:
+            if not os.path.isfile(sync_dst):
+                shutil.copyfile(sync_src, sync_dst)
+            shutil.copyfile(w_src, os.path.join(a.dest, WATCHER_FILE))
+            record("5 watcher", "PASS", f"copied {WATCHER_FILE} to {a.dest}/ (NOT started; start it with: "
+                   f"python3 -B {a.dest}/{WATCHER_FILE} --log /tmp/fathom_watch.log &)")
+
 
     failed = [x for x in results if x[1] == "FAIL"]
     print("\nALL STEPS PASSED" if not failed else "\nSOME STEPS FAILED - fix the first FAIL above")

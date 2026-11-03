@@ -1,4 +1,4 @@
-# fathom-recovery (v1.9.3)
+# fathom-recovery (v1.9.4)
 
 One single-file, command-line tool (`fathom_recovery.py`, needs only `boto3`) that gives **any Fathom panel** a
 recovery copy in S3. It is storage only: it copies files and **never deletes anything**, locally or in S3.
@@ -37,8 +37,8 @@ s3://<bucket>/6_Recovery/<user>/<Panel>/
 ## Setup (once per panel)
 
 ```
-[ -d fathom-recovery-v1.9.3 ] || git clone --depth 1 --branch v1.9.3 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.9.3
-python3 fathom-recovery-v1.9.3/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.9.4 ] || git clone --depth 1 --branch v1.9.4 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.9.4
+python3 fathom-recovery-v1.9.4/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone and runs its `setup` command, which writes
@@ -98,7 +98,8 @@ it verified, so a failed file is retried next time and never stops the sweep. Th
 
 ## Using it from a panel
 
-Nothing watches files or runs by itself; the panel's code, its agent or a schedule has to call it. The standing rules are:
+Nothing watches files or runs by itself unless you start the optional watcher (next section); otherwise the panel's code,
+its agent or a schedule has to call it. The standing rules are:
 
 1. After creating or changing a data file in `outputs/`, run the data sweep as the last step:
    `python3 -B scripts/fathom_recovery.py sweep --config recovery_config.json --state-file .fathom_recovery/state.json --apply`
@@ -136,7 +137,7 @@ Install (the three files must sit in `scripts/`, next to the backup script):
 ```
 python3 setup_panel.py --panel-name "<Panel>" --output-dir outputs --with-dashboard --apply
 # or, in a panel that already has the backup script:
-python3 sync_recovery.py --repo <git url> --ref v1.9.3 --dest scripts --with-dashboard
+python3 sync_recovery.py --repo <git url> --ref v1.9.4 --dest scripts --with-dashboard
 python3 scripts/install_dashboard_hook.py --apply
 ```
 
@@ -145,31 +146,83 @@ holds the workspace lock may skip that sync (the next refresh catches up). Wheth
 (hidden `.fathom_recovery/inbox/` path) are permitted and whether that run has S3 access can only be confirmed in a real
 Fathom panel: refresh once and look for `[FathomRecovery] sync ok` in the console. Nothing here deletes anything.
 
+## Change watcher (optional, v1.9.4)
+
+`recovery_watch.py` keeps the S3 copy current without anyone having to remember to call a sweep. It polls the
+`(mtime, size)` of every file the code sweep could upload (stat only, no hashing). When something changed and the writes
+have settled (`--quiet` seconds, default 3), it runs the SAME two sweeps `recovery_sync.py` runs (data sweep, then code
+sweep) under the SAME lock, so the two never overlap. The sweeps hash the files and upload only new or changed ones to
+the same S3 keys as always (`code/<path>`, `<YYYYMMDD>_current_data/<path>`). It needs `scripts/fathom_recovery.py` and
+`scripts/recovery_sync.py` next to it (`--with-watcher` copies both) and `recovery_config.json` in the workspace root.
+
+```
+python3 -B scripts/recovery_watch.py --log /tmp/fathom_watch.log &   # watch; one baseline sweep at start
+python3 -B scripts/recovery_watch.py --status                        # running? last sweep, sweep and failure counts
+python3 -B scripts/recovery_watch.py --stop                          # ask it to exit (within one scan interval)
+python3 -B scripts/recovery_watch.py --once                          # one sweep now, then exit (for a schedule)
+python3 -B scripts/recovery_watch.py --dry-run                       # sweeps run without --apply; nothing uploaded
+```
+
+Other options: `--interval` (scan every N s, default 5), `--quiet` (settle time, default 3), `--full-every` (forced
+sweep every N s as a safety net, default 900, 0 = off), `--retry-min` (first retry delay after a failed sweep, default 30,
+doubling to a 600 s cap), `--max-runtime` (exit after N s).
+
+What it does and does not do, plainly:
+
+- **Storage only.** Never deletes anything in S3; a file deleted or renamed locally leaves its old S3 copy.
+- **No sweep loop.** It ignores `.fathom_recovery/` and `.fathom_runtime/` and the sweeps' own skip rules, so the sweeps'
+  state files can never trigger another sweep. `--log` refuses a path inside the workspace for the same reason; log to
+  `/tmp`. Empty folders are tracked too (the code sweep backs them up as markers).
+- **Failures never crash it.** No credentials or S3 down: the sweep is reported as a problem, retried with backoff, and
+  recorded in `--status`.
+- **The S3 user folder is pinned at start.** The `<user>` folder normally comes from `bridge.whoami()`. A watcher that
+  outlives the process that started it can lose the bridge, and every later sweep would then resolve `unknown-user` and
+  upload to the WRONG folder (recording those files as uploaded). So the watcher resolves the user once, pins it in
+  `RECOVERY_USER` for all its sweeps, shows it in the log and in `--status` (`user_folder`), and REFUSES to run (exit 1)
+  if it would be `unknown-user`. In that case set `RECOVERY_USER=<your user folder>` or start it from a session where the
+  bridge is available.
+- **One watcher per workspace** (lock file in the temp dir); a second one refuses to start (exit 3).
+- **It is a process, not a service.** It ends when the runtime process ends; a runtime restart stops it and it must be
+  started again. Nothing installs it as a service or starts it for you, and `setup_panel.py` / `sync_recovery.py` only copy
+  the file. If you need something that survives restarts, use a schedule that runs `--once`.
+- **Linux/macOS only** (`fcntl`), like `recovery_sync.py`.
+- It does not replace the sweeps in the standing rules above: they remain correct and are harmless to run while the
+  watcher is running (same lock, nothing new to upload).
+
+Install (the watcher needs `recovery_sync.py`, so `--with-watcher` copies it too):
+
+```
+python3 fathom-recovery-v1.9.4/setup_panel.py --panel-name "<Panel>" --output-dir outputs --with-watcher --apply
+# or, in a panel that already has the backup script:
+python3 sync_recovery.py --repo <git url> --ref v1.9.4 --dest scripts --with-watcher
+```
+
 ## Repo layout
 
 ```
 fathom-recovery/
   fathom_recovery.py              # the whole tool (single file, needs only boto3; __version__ stays "1.9.1")
-  setup_panel.py                  # installs the script from this clone and runs its `setup` (--with-dashboard: + dashboard sync)
-  sync_recovery.py                # pulls a pinned tag from git into a panel (--with-dashboard: + dashboard sync)
+  setup_panel.py                  # installs the script from this clone and runs its `setup` (--with-dashboard, --with-watcher)
+  sync_recovery.py                # pulls a pinned tag from git into a panel (--with-dashboard, --with-watcher)
   panel_snippet.py                # sweep_now() / code_sweep_now() for a panel's own code
   recovery_sync.py                # dashboard sync, server side
   recovery_hook.js                # dashboard sync, browser side
   install_dashboard_hook.py       # adds / removes the hook block in the dashboard HTML
+  recovery_watch.py               # optional change watcher: sweeps automatically after files change (v1.9.4)
   tests/test_fathom_recovery.py   # offline tests, fake S3, no network
-  tests/dashboard_helpers/        # end-to-end dashboard tests (Linux/macOS + node; skipped elsewhere)
+  tests/dashboard_helpers/        # end-to-end dashboard + watcher tests (Linux/macOS + node; skipped elsewhere)
   README.md
 ```
 
 ## Sharing across panels (git)
 
-**Publish (owner):** commit, tag (`git tag -a v1.9.3 -m v1.9.3`) and `git push origin <branch> v1.9.3`.
+**Publish (owner):** commit, tag (`git tag -a v1.9.4 -m v1.9.4`) and `git push origin <branch> v1.9.4`.
 
 **Install in a panel:**
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.9.3 --dest scripts --run-tests --panel-name "<Panel>" [--apply]
+python3 sync_recovery.py --repo <git url> --ref v1.9.4 --dest scripts --run-tests --panel-name "<Panel>" [--apply]
 ```
 
 Prints the installed version, commit and sha256. Pin a tag, not `main`. `--panel-name` also runs the installed script's
@@ -205,6 +258,6 @@ Linux/macOS with `node` on the PATH (they use `fcntl`); elsewhere they are skipp
 - Needs credentials with `s3:PutObject`, `s3:GetObject` (read-back check) and `s3:ListBucket` on `6_Recovery/*`.
   Run `selfcheck --apply` in each panel to confirm.
 - Never put a secret, password, token or key into a code or knowledge file; use an environment variable.
-- v1.9.3 adds files only. `fathom_recovery.py` is byte-identical to the one in tag `v1.9.1` and `v1.9.2`.
+- v1.9.3 and v1.9.4 add files only. `fathom_recovery.py` is byte-identical to the one in tags `v1.9.1`, `v1.9.2` and `v1.9.3`.
 - Old objects (older timestamp runs, old `code/<date>/` folders, the legacy panel-first layout) are never moved or renamed;
   `list`, `list --legacy`, `list-code` and `restore-code` still read them.

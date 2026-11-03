@@ -797,6 +797,60 @@ class DashboardInstall(unittest.TestCase):
             self.assertTrue(Path(ROOT, n).is_file(), n)
         self.assertNotIn("</script", Path(ROOT, "recovery_hook.js").read_text().lower())
 
+    def test_watcher_ships_with_the_repo_and_never_deletes(self):
+        text = Path(ROOT, "recovery_watch.py").read_text()
+        self.assertTrue(text.startswith("#!/usr/bin/env python3"))
+        for bad in ("delete_object", "delete_objects", "lifecycle", "os.remove(os.path.join(ROOT", "shutil.rmtree"):
+            self.assertNotIn(bad, text)
+
+    def test_setup_panel_with_watcher_copies_files_and_does_not_start_it(self):
+        sp = load("setup_panel")
+        sp.results.clear()
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(" ".join(map(str, cmd)))
+            return subprocess.CompletedProcess(cmd, 0, "SUMMARY uploaded=0 unchanged=0 failed=0", "")
+        buf = io.StringIO()
+        with mock.patch.object(sp.subprocess, "run", run), contextlib.redirect_stdout(buf):
+            rc = sp.main(["--panel-name", "P", "--with-watcher", "--apply"])
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(Path("scripts", "recovery_watch.py").read_bytes(), Path(ROOT, "recovery_watch.py").read_bytes())
+        self.assertEqual(Path("scripts", "recovery_sync.py").read_bytes(), Path(ROOT, "recovery_sync.py").read_bytes())
+        self.assertIn("[PASS] 5 watcher", buf.getvalue())
+        self.assertIn("NOT started", buf.getvalue())
+        self.assertFalse([c for c in calls if "recovery_watch" in c], "the watcher must never be started by setup")
+        self.assertFalse(Path("scripts", "recovery_hook.js").exists())       # not asked for: no dashboard files
+        sp.results.clear()
+        with mock.patch.object(sp.subprocess, "run", run), contextlib.redirect_stdout(io.StringIO()):
+            sp.main(["--panel-name", "P", "--dest", "d2"])                   # without the flag nothing is copied
+        self.assertFalse(Path("d2", "recovery_watch.py").exists())
+
+    def test_sync_recovery_with_watcher_installs_watcher_and_sync_from_a_tag(self):
+        sr = load("sync_recovery")
+        repo = os.path.join(self._td.name, "src")
+        os.makedirs(os.path.join(repo, "tests"))
+        Path(repo, "fathom_recovery.py").write_text('__version__ = "9.9.9"\n')
+        for n in DASH + ("recovery_watch.py",):
+            Path(repo, n).write_text("# " + n + "\n")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"], ["git", "commit", "-q", "-m", "x"], ["git", "tag", "v9.9.9"]):
+            subprocess.run(cmd, cwd=repo, env=env, check=True, capture_output=True)
+        res = sr.sync(repo, "v9.9.9", os.path.join(self._td.name, "d"), with_watcher=True)
+        self.assertEqual(sorted(res["watcher_scripts"]), ["recovery_sync.py", "recovery_watch.py"])
+        self.assertTrue(Path(self._td.name, "d", "recovery_watch.py").is_file())
+        self.assertTrue(Path(self._td.name, "d", "recovery_sync.py").is_file())
+        self.assertFalse(Path(self._td.name, "d", "recovery_hook.js").exists())
+        res2 = sr.sync(repo, "v9.9.9", os.path.join(self._td.name, "d2"))
+        self.assertIsNone(res2["watcher_scripts"])
+        self.assertFalse(Path(self._td.name, "d2", "recovery_watch.py").exists())
+        Path(repo, "recovery_watch.py").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=repo, env=env, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "y"], cwd=repo, env=env, check=True, capture_output=True)
+        subprocess.run(["git", "tag", "v9.9.8"], cwd=repo, env=env, check=True, capture_output=True)
+        with self.assertRaises(RuntimeError):
+            sr.sync(repo, "v9.9.8", os.path.join(self._td.name, "d3"), with_watcher=True)
+
     def test_setup_panel_with_dashboard_copies_files_and_runs_the_installer(self):
         sp = load("setup_panel")
         sp.results.clear()
@@ -904,6 +958,9 @@ class DashboardEndToEnd(unittest.TestCase):
     def test_refresh_flow_new_records_reach_the_s3_snapshot(self):
         self._run(sys.executable, "-B", "e2e_refresh_test.py")
 
+    def test_change_watcher_end_to_end(self):
+        self._run(sys.executable, "-B", "watch_test.py")
+
 
 class RepoFiles(unittest.TestCase):
     def test_no_stale_api_names_in_companion_files_or_readme(self):
@@ -918,8 +975,11 @@ class RepoFiles(unittest.TestCase):
 
     def test_readme_names_current_version_and_commands(self):
         text = Path(ROOT, "README.md").read_text()
-        self.assertIn("v1.9.3", text)
+        self.assertIn("v1.9.4", text)
         self.assertNotIn("--branch v1.9.1", text)       # the tag v1.9.1 only has the script, not the companion files
+        self.assertNotIn("--branch v1.9.3", text)
+        for s in ("recovery_watch.py", "--with-watcher", "Change watcher"):
+            self.assertIn(s, text)
         for cmd in ("setup", "sweep", "code-sweep", "selfcheck", "list-code", "restore-code", "verify-code"):
             self.assertIn(cmd, text)
         self.assertIn("<YYYYMMDD>_current_data", text)
