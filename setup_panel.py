@@ -3,7 +3,7 @@
 
 Run it from the panel's workspace root, using the copy inside the cloned repo:
 
-    python3 fathom-recovery-v1.9.2/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
+    python3 fathom-recovery-v1.9.3/setup_panel.py --panel-name "My Panel" --output-dir outputs [--apply]
 
 Steps (each prints PASS / FAIL / SKIP):
   1. panel name is valid (empty, '.', '..', '<' and '>' are rejected)
@@ -12,6 +12,10 @@ Steps (each prints PASS / FAIL / SKIP):
      existing config is kept), creates the output folder if missing, runs selfcheck (read-only; with --apply it
      writes one selfcheck_probe.txt into today's <YYYYMMDD>_current_data/ folder), and then the first
      data sweep (outputs/ -> <YYYYMMDD>_current_data/) and the first code-sweep (whole workspace -> code/).
+
+  4. with --with-dashboard: copy recovery_sync.py, recovery_hook.js and install_dashboard_hook.py next to the
+     installed script and run the installer, which finds the single dashboard HTML in the workspace and (only with
+     --apply) inserts one marked hook block. No HTML found or several candidates: it changes nothing (SKIP).
 
 Dry run by default: nothing is written to S3 unless --apply is given. Safe to run again at any time.
 Exit code 0 only if no step failed.
@@ -26,6 +30,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+DASHBOARD_FILES = ("recovery_sync.py", "recovery_hook.js", "install_dashboard_hook.py")
 results: list[tuple[str, str, str]] = []
 
 
@@ -55,6 +60,9 @@ def main(argv=None) -> int:
     p.add_argument("--dest", default="scripts", help="where to install fathom_recovery.py")
     p.add_argument("--apply", action="store_true", help="write to S3 (selfcheck probe, data sweep, code sweep)")
     p.add_argument("--with-snippet", action="store_true", help="also copy panel_snippet.py into the panel")
+    p.add_argument("--with-dashboard", action="store_true",
+                   help="also install the dashboard->S3 sync scripts and the hook into the dashboard HTML "
+                        "(the hook is only inserted with --apply)")
     p.add_argument("--user", default=None, help="override the user folder (default: RECOVERY_USER, whoami, unknown-user)")
     a = p.parse_args(argv)
 
@@ -104,6 +112,27 @@ def main(argv=None) -> int:
         record("3 setup" + (" --apply" if a.apply else " (dry run)"), "PASS", detail or "ok")
     else:
         record("3 setup" + (" --apply" if a.apply else " (dry run)"), "FAIL", f"exit {r.returncode}: {detail}")
+
+    # 4. dashboard sync (optional): copy the three scripts, then let the installer find the dashboard HTML
+    if a.with_dashboard:
+        missing = [n for n in DASHBOARD_FILES if not os.path.isfile(os.path.join(HERE, n))]
+        if missing:
+            record("4 dashboard", "FAIL", "missing in the clone: " + ", ".join(missing))
+        else:
+            for n in DASHBOARD_FILES:
+                shutil.copyfile(os.path.join(HERE, n), os.path.join(a.dest, n))
+            record("4a dashboard scripts", "PASS", "copied " + ", ".join(DASHBOARD_FILES) + " to " + a.dest + "/")
+            inst = os.path.join(a.dest, "install_dashboard_hook.py")
+            cmd = [sys.executable, "-B", inst] + (["--apply"] if a.apply else [])
+            r = subprocess.run(cmd, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"), capture_output=True, text=True, timeout=120)
+            out2 = (r.stdout + r.stderr).strip()
+            print(out2)
+            if r.returncode == 0:
+                record("4b hook", "PASS", (out2.splitlines() or [""])[0][:200] + ("" if a.apply else " (dry run)"))
+            elif r.returncode == 2:
+                record("4b hook", "SKIP", "no single dashboard HTML identified; nothing was changed")
+            else:
+                record("4b hook", "FAIL", f"exit {r.returncode}: {(out2.splitlines() or [''])[-1][:200]}")
 
     failed = [x for x in results if x[1] == "FAIL"]
     print("\nALL STEPS PASSED" if not failed else "\nSOME STEPS FAILED - fix the first FAIL above")

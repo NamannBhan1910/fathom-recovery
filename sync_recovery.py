@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pull fathom_recovery.py from the shared git repo into THIS panel's workspace.
 
-    python3 sync_recovery.py --repo <git url or path> --ref v1.9.2 [--dest scripts] [--run-tests]
+    python3 sync_recovery.py --repo <git url or path> --ref v1.9.3 [--dest scripts] [--run-tests]
                              [--panel-name "<Panel>" --output-dir outputs [--apply]]
 
 * --ref should be a tag (pinned version) so later changes can't alter a panel silently.
@@ -9,6 +9,8 @@
   HTTP header and is never put in the URL or printed.
 * Copies fathom_recovery.py (and, with --run-tests, runs the offline test-suite from
   the fetched checkout, which touches no S3).
+* --with-dashboard also copies the three dashboard-sync scripts (recovery_sync.py, recovery_hook.js,
+  install_dashboard_hook.py) into --dest. It never edits a dashboard HTML.
 * Prints the installed version and sha256 so a panel owner can confirm what they got.
 * With --panel-name "<Panel>" it also runs the installed script's `setup` command in the current folder
   (config if missing, output folder, selfcheck, sweep, code-sweep). That is a dry run unless --apply.
@@ -42,7 +44,10 @@ def _git(args: list[str], cwd: str | None = None) -> str:
     return r.stdout.strip()
 
 
-def sync(repo: str, ref: str, dest: str, run_tests: bool = False) -> dict:
+DASHBOARD_FILES = ("recovery_sync.py", "recovery_hook.js", "install_dashboard_hook.py")
+
+
+def sync(repo: str, ref: str, dest: str, run_tests: bool = False, with_dashboard: bool = False) -> dict:
     tmp = tempfile.mkdtemp(prefix="fathom_recovery_sync_")
     try:
         checkout = os.path.join(tmp, "repo")
@@ -67,6 +72,16 @@ def sync(repo: str, ref: str, dest: str, run_tests: bool = False) -> dict:
         shutil.copyfile(src, target)
         with open(target, "rb") as fh:
             sha = hashlib.sha256(fh.read()).hexdigest()
+        dashboard = None
+        if with_dashboard:
+            missing = [n for n in DASHBOARD_FILES if not os.path.isfile(os.path.join(checkout, n))]
+            if missing:
+                raise RuntimeError("dashboard scripts not in the repo at that ref: " + ", ".join(missing))
+            dashboard = {}
+            for n in DASHBOARD_FILES:
+                shutil.copyfile(os.path.join(checkout, n), os.path.join(dest, n))
+                with open(os.path.join(dest, n), "rb") as fh:
+                    dashboard[n] = hashlib.sha256(fh.read()).hexdigest()[:12]
         return {
             "ok": True,
             "ref": ref,
@@ -75,6 +90,7 @@ def sync(repo: str, ref: str, dest: str, run_tests: bool = False) -> dict:
             "installed_to": target,
             "sha256": sha,
             "tests": tests,
+            "dashboard_scripts": dashboard,
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -103,13 +119,16 @@ def main(argv=None) -> int:
     p.add_argument("--ref", required=True, help="tag (recommended) or branch")
     p.add_argument("--dest", default="scripts")
     p.add_argument("--run-tests", action="store_true")
+    p.add_argument("--with-dashboard", action="store_true",
+                   help="also install recovery_sync.py, recovery_hook.js and install_dashboard_hook.py into --dest "
+                        "(does NOT edit any dashboard HTML; run install_dashboard_hook.py --apply for that)")
     p.add_argument("--panel-name", default=None,
                    help="also run the installed script's `setup` for this panel (dry run unless --apply)")
     p.add_argument("--output-dir", default="outputs", help="folder the panel writes data files to (with --panel-name)")
     p.add_argument("--apply", action="store_true", help="with --panel-name: really write to S3")
     a = p.parse_args(argv)
     try:
-        res = sync(a.repo, a.ref, a.dest, a.run_tests)
+        res = sync(a.repo, a.ref, a.dest, a.run_tests, a.with_dashboard)
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
         return 1

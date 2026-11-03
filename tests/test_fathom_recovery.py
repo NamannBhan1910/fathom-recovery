@@ -779,6 +779,132 @@ class SyncRecovery(unittest.TestCase):
         self.assertNotIn("init", seen[0])
 
 
+DASH = ("recovery_sync.py", "recovery_hook.js", "install_dashboard_hook.py")
+
+
+class DashboardInstall(unittest.TestCase):
+    """setup_panel.py / sync_recovery.py --with-dashboard (subprocess faked or a real local git repo; no S3)."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.cwd = os.getcwd()
+        os.chdir(self._td.name)
+        self.addCleanup(os.chdir, self.cwd)
+
+    def test_all_three_dashboard_files_ship_with_the_repo(self):
+        for n in DASH:
+            self.assertTrue(Path(ROOT, n).is_file(), n)
+        self.assertNotIn("</script", Path(ROOT, "recovery_hook.js").read_text().lower())
+
+    def test_setup_panel_with_dashboard_copies_files_and_runs_the_installer(self):
+        sp = load("setup_panel")
+        sp.results.clear()
+        Path("dashboard.html").write_text("<html><head></head><body><p>x</p></body></html>")
+        calls = []
+        real_run = subprocess.run
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if "install_dashboard_hook.py" in " ".join(map(str, cmd)):
+                return real_run(cmd, **kw)
+            return subprocess.CompletedProcess(cmd, 0, "SUMMARY uploaded=0 unchanged=0 failed=0", "")
+        buf = io.StringIO()
+        with mock.patch.object(sp.subprocess, "run", run), contextlib.redirect_stdout(buf):
+            rc = sp.main(["--panel-name", "P", "--with-dashboard", "--apply"])
+        self.assertEqual(rc, 0, buf.getvalue())
+        for n in DASH:
+            self.assertEqual(Path("scripts", n).read_bytes(), Path(ROOT, n).read_bytes())
+        html = Path("dashboard.html").read_text()
+        self.assertEqual(html.count("fathom-recovery-hook:start"), 1)
+        self.assertLess(html.index("fathom-recovery-hook:start"), html.index("<p>x</p>"))
+        self.assertIn("[PASS] 4b hook", buf.getvalue())
+
+    def test_setup_panel_dry_run_does_not_touch_the_html_and_no_html_is_a_skip(self):
+        sp = load("setup_panel")
+        sp.results.clear()
+        Path("dashboard.html").write_text("<html><body>x</body></html>")
+        before = Path("dashboard.html").read_bytes()
+        real_run = subprocess.run
+
+        def run(cmd, **kw):
+            if "install_dashboard_hook.py" in " ".join(map(str, cmd)):
+                return real_run(cmd, **kw)
+            return subprocess.CompletedProcess(cmd, 0, "SUMMARY uploaded=0 unchanged=0 failed=0", "")
+        with mock.patch.object(sp.subprocess, "run", run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sp.main(["--panel-name", "P", "--with-dashboard"]), 0)
+        self.assertEqual(Path("dashboard.html").read_bytes(), before)
+        os.remove("dashboard.html")
+        sp.results.clear()
+        buf = io.StringIO()
+        with mock.patch.object(sp.subprocess, "run", run), contextlib.redirect_stdout(buf):
+            rc = sp.main(["--panel-name", "P", "--with-dashboard", "--apply"])
+        self.assertEqual(rc, 0)
+        self.assertIn("[SKIP] 4b hook", buf.getvalue())
+
+    def test_setup_panel_without_the_flag_leaves_dashboard_alone(self):
+        sp = load("setup_panel")
+        sp.results.clear()
+        Path("dashboard.html").write_text("<html><body>x</body></html>")
+        run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "SUMMARY uploaded=0 unchanged=0 failed=0", "")
+        with mock.patch.object(sp.subprocess, "run", run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sp.main(["--panel-name", "P", "--apply"]), 0)
+        self.assertNotIn("fathom-recovery-hook", Path("dashboard.html").read_text())
+        self.assertFalse(Path("scripts/recovery_sync.py").exists())
+
+    def test_sync_recovery_with_dashboard_installs_the_three_files_from_a_tag(self):
+        sr = load("sync_recovery")
+        repo = os.path.join(self._td.name, "src")
+        os.makedirs(os.path.join(repo, "tests"))
+        Path(repo, "fathom_recovery.py").write_text('__version__ = "9.9.9"\n')
+        for n in DASH:
+            Path(repo, n).write_text("# " + n + "\n")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"], ["git", "commit", "-q", "-m", "x"], ["git", "tag", "v9.9.9"]):
+            subprocess.run(cmd, cwd=repo, env=env, check=True, capture_output=True)
+        res = sr.sync(repo, "v9.9.9", os.path.join(self._td.name, "d"), with_dashboard=True)
+        self.assertEqual(sorted(res["dashboard_scripts"]), sorted(DASH))
+        for n in DASH:
+            self.assertTrue(Path(self._td.name, "d", n).is_file())
+        res2 = sr.sync(repo, "v9.9.9", os.path.join(self._td.name, "d2"))
+        self.assertIsNone(res2["dashboard_scripts"])
+        self.assertFalse(Path(self._td.name, "d2", "recovery_sync.py").exists())
+        Path(repo, "recovery_hook.js").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=repo, env=env, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "y"], cwd=repo, env=env, check=True, capture_output=True)
+        subprocess.run(["git", "tag", "v9.9.8"], cwd=repo, env=env, check=True, capture_output=True)
+        with self.assertRaises(RuntimeError):
+            sr.sync(repo, "v9.9.8", os.path.join(self._td.name, "d3"), with_dashboard=True)
+
+
+HELPERS = os.path.join(ROOT, "tests", "dashboard_helpers")
+_NODE = __import__("shutil").which("node")
+_CAN_E2E = os.name != "nt" and _NODE is not None and sys.platform != "win32"
+
+
+@unittest.skipUnless(_CAN_E2E, "dashboard end-to-end tests need Linux/macOS (fcntl) and node on the PATH")
+class DashboardEndToEnd(unittest.TestCase):
+    """Real scripts in temp workspaces against a fake S3 (tests/dashboard_helpers); node plays the browser."""
+
+    def _run(self, *cmd):
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        r = subprocess.run(list(cmd), cwd=HELPERS, env=env, capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, (r.stdout + r.stderr)[-2000:])      # each helper exits 1 on any failed check
+        self.assertIn(" 0 failed", r.stdout)
+
+    def test_hook_unit_checks_under_node(self):
+        self._run(_NODE, "hook_test.js")
+
+    def test_installer_discovery(self):
+        self._run(sys.executable, "-B", "discover_test.py")
+
+    def test_sync_and_installer_end_to_end(self):
+        self._run(sys.executable, "-B", "run_sync_test.py")
+
+    def test_refresh_flow_new_records_reach_the_s3_snapshot(self):
+        self._run(sys.executable, "-B", "e2e_refresh_test.py")
+
+
 class RepoFiles(unittest.TestCase):
     def test_no_stale_api_names_in_companion_files_or_readme(self):
         stale = ("upload_to_recovery", "copy_created_object_to_recovery", "put_object_and_copy_to_recovery",
@@ -792,7 +918,7 @@ class RepoFiles(unittest.TestCase):
 
     def test_readme_names_current_version_and_commands(self):
         text = Path(ROOT, "README.md").read_text()
-        self.assertIn("v1.9.2", text)
+        self.assertIn("v1.9.3", text)
         self.assertNotIn("--branch v1.9.1", text)       # the tag v1.9.1 only has the script, not the companion files
         for cmd in ("setup", "sweep", "code-sweep", "selfcheck", "list-code", "restore-code", "verify-code"):
             self.assertIn(cmd, text)

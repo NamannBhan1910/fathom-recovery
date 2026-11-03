@@ -1,4 +1,4 @@
-# fathom-recovery (v1.9.2)
+# fathom-recovery (v1.9.3)
 
 One single-file, command-line tool (`fathom_recovery.py`, needs only `boto3`) that gives **any Fathom panel** a
 recovery copy in S3. It is storage only: it copies files and **never deletes anything**, locally or in S3.
@@ -37,8 +37,8 @@ s3://<bucket>/6_Recovery/<user>/<Panel>/
 ## Setup (once per panel)
 
 ```
-[ -d fathom-recovery-v1.9.2 ] || git clone --depth 1 --branch v1.9.2 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.9.2
-python3 fathom-recovery-v1.9.2/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.9.3 ] || git clone --depth 1 --branch v1.9.3 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.9.3
+python3 fathom-recovery-v1.9.3/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone and runs its `setup` command, which writes
@@ -111,27 +111,65 @@ right state files and return `{ok, uploaded, unchanged, failed, exit_code, outpu
 
 Use `python3 -B` or `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__` appears in the panel.
 
+## Dashboard sync (optional, v1.9.3)
+
+A refresh in Fathom does not change the dashboard HTML, so a plain backup of the HTML would never contain the records
+that arrived after a refresh. Dashboard sync closes that gap. It is three small files, installed next to
+`scripts/fathom_recovery.py`:
+
+| File | What it does |
+|---|---|
+| `recovery_hook.js` | Browser code, inserted at the TOP of the dashboard. Wraps `window.Panel.runFile` / `readFile` / `readData`, remembers every successful response, and after a load/refresh (debounced, one sync per burst) saves them under `.fathom_recovery/inbox/` and runs `scripts/recovery_sync.py`. Logs `[FathomRecovery] sync ok`; state in `window.FathomRecovery.state`. |
+| `recovery_sync.py` | Server side. Under a lock it merges the captured data into `outputs/dashboard_data/` (incl. `dashboard_responses.json`), builds `outputs/dashboard_snapshot/<dashboard>.html` (the page without the hook, plus a shim that replays the last refresh's data) and runs the data sweep and the code sweep. Prints one JSON line; exit 0 only if everything worked. `--dry-run`, `--no-code`. |
+| `install_dashboard_hook.py` | Adds (or `--remove`s) ONE marked block in the dashboard HTML. With no file name it finds the single dashboard HTML in the workspace (the only HTML file, else the only one named `*dashboard*`, else the only one using `window.Panel`); with several candidates it lists them and changes nothing (exit 2). Dry run unless `--apply`; atomic write; `--remove` restores the original bytes. |
+
+What lands in S3 after a refresh (only changed files upload):
+
+```
+<YYYYMMDD>_current_data/dashboard_data/dashboard_responses.json   the data the dashboard received (same day: overwritten)
+code/outputs/dashboard_snapshot/<dashboard>.html                  opens outside Fathom and shows the last refresh's data
+code/<path>/<dashboard>.html                                      the live dashboard, overwritten only when the file itself changes
+```
+
+Install (the three files must sit in `scripts/`, next to the backup script):
+
+```
+python3 setup_panel.py --panel-name "<Panel>" --output-dir outputs --with-dashboard --apply
+# or, in a panel that already has the backup script:
+python3 sync_recovery.py --repo <git url> --ref v1.9.3 --dest scripts --with-dashboard
+python3 scripts/install_dashboard_hook.py --apply
+```
+
+Limits, stated plainly: the snapshot replays only what the page asked `window.Panel` for. A refresh while an agent run
+holds the workspace lock may skip that sync (the next refresh catches up). Whether page-side `runFile` / `writeFile`
+(hidden `.fathom_recovery/inbox/` path) are permitted and whether that run has S3 access can only be confirmed in a real
+Fathom panel: refresh once and look for `[FathomRecovery] sync ok` in the console. Nothing here deletes anything.
+
 ## Repo layout
 
 ```
 fathom-recovery/
-  fathom_recovery.py              # the whole tool (single file, needs only boto3)
-  setup_panel.py                  # installs the script from this clone and runs its `setup`
-  sync_recovery.py                # pulls a pinned tag from git into a panel
+  fathom_recovery.py              # the whole tool (single file, needs only boto3; __version__ stays "1.9.1")
+  setup_panel.py                  # installs the script from this clone and runs its `setup` (--with-dashboard: + dashboard sync)
+  sync_recovery.py                # pulls a pinned tag from git into a panel (--with-dashboard: + dashboard sync)
   panel_snippet.py                # sweep_now() / code_sweep_now() for a panel's own code
+  recovery_sync.py                # dashboard sync, server side
+  recovery_hook.js                # dashboard sync, browser side
+  install_dashboard_hook.py       # adds / removes the hook block in the dashboard HTML
   tests/test_fathom_recovery.py   # offline tests, fake S3, no network
+  tests/dashboard_helpers/        # end-to-end dashboard tests (Linux/macOS + node; skipped elsewhere)
   README.md
 ```
 
 ## Sharing across panels (git)
 
-**Publish (owner):** commit, tag (`git tag -a v1.9.2 -m v1.9.2`) and `git push origin <branch> v1.9.2`.
+**Publish (owner):** commit, tag (`git tag -a v1.9.3 -m v1.9.3`) and `git push origin <branch> v1.9.3`.
 
 **Install in a panel:**
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.9.2 --dest scripts --run-tests --panel-name "<Panel>" [--apply]
+python3 sync_recovery.py --repo <git url> --ref v1.9.3 --dest scripts --run-tests --panel-name "<Panel>" [--apply]
 ```
 
 Prints the installed version, commit and sha256. Pin a tag, not `main`. `--panel-name` also runs the installed script's
@@ -157,7 +195,8 @@ All five print 1 for the v1.9.x script (`__version__ = "1.9.1"`). A script faili
 python3 -B -m unittest discover -s tests -v
 ```
 
-Offline only; a fake S3 stands in for the bucket and nothing real is written.
+Offline only; a fake S3 stands in for the bucket and nothing real is written. The dashboard end-to-end tests run only on
+Linux/macOS with `node` on the PATH (they use `fcntl`); elsewhere they are skipped, not failed.
 
 ## Rules of thumb
 
@@ -166,5 +205,6 @@ Offline only; a fake S3 stands in for the bucket and nothing real is written.
 - Needs credentials with `s3:PutObject`, `s3:GetObject` (read-back check) and `s3:ListBucket` on `6_Recovery/*`.
   Run `selfcheck --apply` in each panel to confirm.
 - Never put a secret, password, token or key into a code or knowledge file; use an environment variable.
+- v1.9.3 adds files only. `fathom_recovery.py` is byte-identical to the one in tag `v1.9.1` and `v1.9.2`.
 - Old objects (older timestamp runs, old `code/<date>/` folders, the legacy panel-first layout) are never moved or renamed;
   `list`, `list --legacy`, `list-code` and `restore-code` still read them.
