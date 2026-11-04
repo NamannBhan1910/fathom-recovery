@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pull fathom_recovery.py from the shared git repo into THIS panel's workspace.
 
-    python3 sync_recovery.py --repo <git url or path> --ref v1.9.4 [--dest scripts] [--run-tests]
+    python3 sync_recovery.py --repo <git url or path> --ref v1.9.5 [--dest scripts] [--run-tests]
                              [--panel-name "<Panel>" --output-dir outputs [--apply]]
 
 * --ref should be a tag (pinned version) so later changes can't alter a panel silently.

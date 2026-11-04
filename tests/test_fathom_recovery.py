@@ -975,9 +975,11 @@ class RepoFiles(unittest.TestCase):
 
     def test_readme_names_current_version_and_commands(self):
         text = Path(ROOT, "README.md").read_text()
-        self.assertIn("v1.9.4", text)
+        self.assertIn("v1.9.5", text)
+        self.assertIn("panel-body", text)               # the standalone-document snapshot is documented
         self.assertNotIn("--branch v1.9.1", text)       # the tag v1.9.1 only has the script, not the companion files
         self.assertNotIn("--branch v1.9.3", text)
+        self.assertNotIn("--branch v1.9.4", text)
         for s in ("recovery_watch.py", "--with-watcher", "Change watcher"):
             self.assertIn(s, text)
         for cmd in ("setup", "sweep", "code-sweep", "selfcheck", "list-code", "restore-code", "verify-code"):

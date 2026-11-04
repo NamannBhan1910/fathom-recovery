@@ -163,6 +163,13 @@ def build_snapshot():
     except UnicodeDecodeError:
         return {"error": "dashboard is not utf-8: " + chosen}
     base = inst.BLOCK_RE.sub("", html)                  # the snapshot must not carry the live hook
+    # Fathom renders dashboard fragments inside .panel-body. Supply that
+    # container when the snapshot is opened as a standalone HTML document.
+    if not re.match(r"\s*(?:<!doctype[^>]*>\s*)?<html(?:\s|>)", base, re.I):
+        base = ('<!doctype html><html><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                '</head><body><div class="panel-body">' + base +
+                '</div></body></html>')
     out = inst.insert_block(base, inst.snapshot_block(data)).encode("utf-8")
     dest = os.path.join(ROOT, output_dir(), "dashboard_snapshot", os.path.basename(chosen))
     try:

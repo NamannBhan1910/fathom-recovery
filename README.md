@@ -1,4 +1,4 @@
-# fathom-recovery (v1.9.4)
+# fathom-recovery (v1.9.5)
 
 One single-file, command-line tool (`fathom_recovery.py`, needs only `boto3`) that gives **any Fathom panel** a
 recovery copy in S3. It is storage only: it copies files and **never deletes anything**, locally or in S3.
@@ -37,8 +37,8 @@ s3://<bucket>/6_Recovery/<user>/<Panel>/
 ## Setup (once per panel)
 
 ```
-[ -d fathom-recovery-v1.9.4 ] || git clone --depth 1 --branch v1.9.4 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.9.4
-python3 fathom-recovery-v1.9.4/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
+[ -d fathom-recovery-v1.9.5 ] || git clone --depth 1 --branch v1.9.5 https://github.com/NamannBhan1910/fathom-recovery.git fathom-recovery-v1.9.5
+python3 fathom-recovery-v1.9.5/setup_panel.py --panel-name "<Panel>" --output-dir outputs --apply
 ```
 
 `setup_panel.py` installs `scripts/fathom_recovery.py` from that clone and runs its `setup` command, which writes
@@ -112,7 +112,16 @@ right state files and return `{ok, uploaded, unchanged, failed, exit_code, outpu
 
 Use `python3 -B` or `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__` appears in the panel.
 
-## Dashboard sync (optional, v1.9.3)
+## Dashboard sync (optional, v1.9.3; snapshot as a standalone document since v1.9.5)
+
+**v1.9.5: the snapshot is a standalone HTML document.** Most Fathom dashboards are fragments (no `<html>`, `<head>` or
+`<body>`), and Fathom renders them inside a `.panel-body` container. When `recovery_sync.py` builds the snapshot of a
+fragment it wraps it in `<!doctype html><html><head>...</head><body><div class="panel-body">...</div></body></html>`,
+so CSS scoped to `.panel-body` still styles the page after you download it from S3 and open it outside Fathom. A
+dashboard that is already a full document is not wrapped. Every refresh that brings new data rewrites the snapshot and
+uploads it in the same sync call (data sweep and code sweep both run inside it), so `code/outputs/dashboard_snapshot/
+<dashboard>.html` in S3 follows each refresh. A copy you already downloaded does not update itself: download it again
+after a later refresh. This is the only change in v1.9.5; `recovery_hook.js` is untouched.
 
 A refresh in Fathom does not change the dashboard HTML, so a plain backup of the HTML would never contain the records
 that arrived after a refresh. Dashboard sync closes that gap. It is three small files, installed next to
@@ -137,7 +146,7 @@ Install (the three files must sit in `scripts/`, next to the backup script):
 ```
 python3 setup_panel.py --panel-name "<Panel>" --output-dir outputs --with-dashboard --apply
 # or, in a panel that already has the backup script:
-python3 sync_recovery.py --repo <git url> --ref v1.9.4 --dest scripts --with-dashboard
+python3 sync_recovery.py --repo <git url> --ref v1.9.5 --dest scripts --with-dashboard
 python3 scripts/install_dashboard_hook.py --apply
 ```
 
@@ -192,9 +201,9 @@ What it does and does not do, plainly:
 Install (the watcher needs `recovery_sync.py`, so `--with-watcher` copies it too):
 
 ```
-python3 fathom-recovery-v1.9.4/setup_panel.py --panel-name "<Panel>" --output-dir outputs --with-watcher --apply
+python3 fathom-recovery-v1.9.5/setup_panel.py --panel-name "<Panel>" --output-dir outputs --with-watcher --apply
 # or, in a panel that already has the backup script:
-python3 sync_recovery.py --repo <git url> --ref v1.9.4 --dest scripts --with-watcher
+python3 sync_recovery.py --repo <git url> --ref v1.9.5 --dest scripts --with-watcher
 ```
 
 ## Repo layout
@@ -216,13 +225,13 @@ fathom-recovery/
 
 ## Sharing across panels (git)
 
-**Publish (owner):** commit, tag (`git tag -a v1.9.4 -m v1.9.4`) and `git push origin <branch> v1.9.4`.
+**Publish (owner):** commit, tag (`git tag -a v1.9.5 -m v1.9.5`) and `git push origin <branch> v1.9.5`.
 
 **Install in a panel:**
 
 ```
 export FATHOM_RECOVERY_GIT_TOKEN=...      # private HTTPS repos only; never put it in the URL
-python3 sync_recovery.py --repo <git url> --ref v1.9.4 --dest scripts --run-tests --panel-name "<Panel>" [--apply]
+python3 sync_recovery.py --repo <git url> --ref v1.9.5 --dest scripts --run-tests --panel-name "<Panel>" [--apply]
 ```
 
 Prints the installed version, commit and sha256. Pin a tag, not `main`. `--panel-name` also runs the installed script's
@@ -258,6 +267,8 @@ Linux/macOS with `node` on the PATH (they use `fcntl`); elsewhere they are skipp
 - Needs credentials with `s3:PutObject`, `s3:GetObject` (read-back check) and `s3:ListBucket` on `6_Recovery/*`.
   Run `selfcheck --apply` in each panel to confirm.
 - Never put a secret, password, token or key into a code or knowledge file; use an environment variable.
-- v1.9.3 and v1.9.4 add files only. `fathom_recovery.py` is byte-identical to the one in tags `v1.9.1`, `v1.9.2` and `v1.9.3`.
+- v1.9.3 and v1.9.4 add files only. v1.9.5 changes `recovery_sync.py` only (plus the version strings in this README, `setup_panel.py`,
+  `sync_recovery.py` and the tests). `fathom_recovery.py` is byte-identical to the one in tags `v1.9.1` to `v1.9.4`, and
+  `recovery_hook.js`, `install_dashboard_hook.py` and `recovery_watch.py` are byte-identical to v1.9.4.
 - Old objects (older timestamp runs, old `code/<date>/` folders, the legacy panel-first layout) are never moved or renamed;
   `list`, `list --legacy`, `list-code` and `restore-code` still read them.

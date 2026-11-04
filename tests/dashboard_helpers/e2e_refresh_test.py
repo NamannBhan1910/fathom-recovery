@@ -77,6 +77,8 @@ check("S3 has the live dashboard (with hook) under code/", "fathom-recovery-hook
 check("S3 has the day-folder data file with the responses", "get_positions" in get(day + "/dashboard_data/dashboard_responses.json"))
 sn = get("code/outputs/dashboard_snapshot/dashboard.html")
 check("S3 snapshot carries the shim and not the live hook", "fathom-snapshot:start" in sn and "fathom-recovery-hook" not in sn)
+check("fragment snapshot has a standalone document and Fathom panel container",
+      sn.lstrip().lower().startswith("<!doctype html>") and sn.count('<div class="panel-body">') == 1)
 c = snap()
 check("snapshot opened outside Fathom returns refresh-1 data (exact args)", json.loads(c["exact"]["result"]["stdout"])["rows"] == 10)
 check("other args fall back to the newest capture; uncaptured call reports clearly; readFile replayed",
@@ -87,6 +89,10 @@ lr = res["lastResult"] or {}
 check("refresh 2 (new records): sync ok", lr.get("ok") and res["rendered_rows"] == 25)
 c = snap()
 check("snapshot in S3 now returns the NEW records (25), not the old ones", json.loads(c["exact"]["result"]["stdout"])["rows"] == 25)
+sn_r2 = get("code/outputs/dashboard_snapshot/dashboard.html")
+check("a refresh with new data re-uploads the snapshot HTML (bytes differ), still ONE standalone document / ONE panel-body",
+      sn_r2 != sn and sn_r2.lstrip().lower().startswith("<!doctype html>") and sn_r2.count('<div class="panel-body">') == 1
+      and sn_r2.lower().count("<html") == 1 and (lr.get("snapshot") or {}).get("written") is True)
 check("same-day data file overwritten, still ONE day folder",
       json.loads(json.loads(get(day + "/dashboard_data/dashboard_responses.json"))["responses"]["runFile|scripts/get_positions.py|--book A"]["r"]["result"]["stdout"])["rows"] == 25
       and {k.split("/")[3] for (b, k) in s3()} == {day, "code"})
@@ -108,6 +114,17 @@ check("editing the dashboard itself updates BOTH the live copy and the snapshot 
 
 r = subprocess.run([sys.executable, "-B", "scripts/install_dashboard_hook.py", "--remove", "--apply"], cwd=ws, env=env, capture_output=True, text=True)
 check("--remove restores the dashboard byte for byte", open(ws + "/app/dashboard.html").read() == d2)
+
+# a dashboard that is ALREADY a full HTML document is not wrapped a second time
+d3 = "<!doctype html>\n<html><head><title>t</title><style>.panel-body .k{color:#222}</style></head><body><div id=\"app\" class=\"k\">full doc</div>\n" + \
+     DASH[DASH.index("<script>"):] + "</body></html>\n"
+open(ws + "/app/dashboard.html", "w").write(d3)
+subprocess.run([sys.executable, "-B", "scripts/install_dashboard_hook.py", "--apply"], cwd=ws, env=env, capture_output=True, text=True)
+res, err = page(25)
+sn3 = get("code/outputs/dashboard_snapshot/dashboard.html")
+check("full-document dashboard: snapshot is not wrapped again and still reaches S3",
+      "full doc" in sn3 and sn3.count('<div class="panel-body">') == 0 and sn3.lower().count("<html") == 1
+      and "fathom-snapshot:start" in sn3 and "fathom-recovery-hook" not in sn3)
 
 print("\nRESULT: %d checks, %d failed" % (len(checks), checks.count(False)))
 print("workspace:", ws)
